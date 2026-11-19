@@ -1,0 +1,11 @@
+{
+  "app": ".venv/bin/python app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["README.md", "cdk*.json", "**/__pycache__", "tests", ".build", ".venv", "docs"]
+  },
+  "context": {
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:target-partitions": ["aws"]
+  }
+}

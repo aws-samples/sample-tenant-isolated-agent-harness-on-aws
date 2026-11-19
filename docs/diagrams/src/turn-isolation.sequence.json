@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "One turn: every tenant check in order",
+    "locale": "en",
+    "output": ".archify/sequence-turn-isolation-20261019-215143/turn-isolation.html",
+    "quality_profile": "showcase",
+    "legend": {
+      "entries": {
+        "dashed": { "label": "only when the turn runs code" }
+      }
+    },
+    "views": [
+      {
+        "id": "front-door",
+        "label": "Front door: tenant from the token",
+        "focus": ["user", "front", "queue"],
+        "note": "The tenant comes from the sign-in token, never the request body, and picks the turn's FIFO lane."
+      },
+      {
+        "id": "tool-call",
+        "label": "Routine tool call",
+        "focus": ["worker", "gateway", "tools"],
+        "note": "The worker signs the tenant context with KMS. The interceptor verifies it and sets the tenant before any tool runs."
+      },
+      {
+        "id": "code-task",
+        "label": "Code task in the tenant's runtime",
+        "focus": ["worker", "runtime", "bucket"],
+        "note": "One complete task goes to the tenant's runtime session, with 15-minute credentials bound to the VPC endpoint."
+      }
+    ]
+  },
+  "participants": [
+    { "id": "user", "type": "external", "label": "Tenant user", "sublabel": "AnyCompany Plumbing" },
+    { "id": "front", "type": "security", "label": "API + ingress", "sublabel": "JWT, then Lambda" },
+    { "id": "queue", "type": "messagebus", "label": "FIFO queue", "sublabel": "SQS" },
+    { "id": "worker", "type": "backend", "label": "Worker", "sublabel": "shared Lambda" },
+    { "id": "gateway", "type": "security", "label": "Gateway", "sublabel": "with interceptor" },
+    { "id": "tools", "type": "backend", "label": "Tools", "sublabel": "Lambda + DynamoDB" },
+    { "id": "runtime", "type": "backend", "label": "Runtime", "sublabel": "tenant's session" },
+    { "id": "bucket", "type": "database", "label": "Tenant bucket", "sublabel": "S3 prefixes" }
+  ],
+  "segments": [
+    { "from": 155, "to": 325, "label": "1. Submit" },
+    { "from": 355, "to": 490, "label": "2. Start the turn" },
+    { "from": 520, "to": 685, "label": "3. Routine tool call" },
+    { "from": 715, "to": 880, "label": "4. Code task, about 1 in 10" },
+    { "from": 910, "to": 1045, "label": "5. Answer" }
+  ],
+  "messages": [
+    { "id": "submit", "from": "user", "to": "front", "y": 175, "label": "POST /turns + JWT", "variant": "emphasis", "note": "No token or a forged one: 401" },
+    { "id": "enqueue", "from": "front", "to": "queue", "y": 241, "label": "turn, group = tenant", "variant": "emphasis", "note": "Tenant from the token; body naming another: 403" },
+    { "id": "accepted", "from": "front", "to": "user", "y": 307, "label": "202 + requestId", "variant": "return" },
+    { "id": "deliver", "from": "queue", "to": "worker", "y": 370, "label": "one turn", "variant": "emphasis", "note": "FIFO lane plus lease: one turn per tenant" },
+    { "id": "restore", "from": "worker", "to": "bucket", "y": 436, "label": "restore conversation", "variant": "security", "note": "STS session tagged TenantId: own prefix only" },
+    { "id": "tool-call", "from": "worker", "to": "gateway", "y": 535, "label": "SigV4 + signed tenant", "variant": "security", "note": "Context signed with KMS; missing or forged: 403" },
+    { "id": "tool-run", "from": "gateway", "to": "tools", "y": 601, "label": "call, tenant overwritten", "variant": "security", "note": "Tool role reads TENANT#<tenant> keys only" },
+    { "id": "jobs", "from": "tools", "to": "worker", "y": 667, "label": "jobs J7, J9", "variant": "return" },
+    { "id": "task", "from": "worker", "to": "runtime", "y": 730, "label": "one task + 15-min creds", "variant": "dashed", "note": "Resource policy: worker only; session = tenant" },
+    { "id": "sync", "from": "runtime", "to": "bucket", "y": 796, "label": "sync workspace", "variant": "security", "note": "S3 only via the VPC endpoint, own prefix" },
+    { "id": "result", "from": "runtime", "to": "worker", "y": 862, "label": "script result", "variant": "return" },
+    { "id": "save", "from": "worker", "to": "bucket", "y": 925, "label": "save conversation", "variant": "security" },
+    { "id": "poll", "from": "user", "to": "front", "y": 959, "label": "GET /turns/{id}", "note": "Another tenant asking for it: 404" },
+    { "id": "answer", "from": "front", "to": "user", "y": 1025, "label": "answer", "variant": "return" }
+  ],
+  "activations": [
+    { "participant": "front", "from": 175, "to": 307, "type": "security" },
+    { "participant": "worker", "from": 370, "to": 931, "type": "backend" },
+    { "participant": "gateway", "from": 535, "to": 607, "type": "security" },
+    { "participant": "tools", "from": 601, "to": 667, "type": "backend" },
+    { "participant": "runtime", "from": 730, "to": 862, "type": "backend" }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Refusals in this turn",
+      "items": [
+        "401 without a valid sign-in token",
+        "403 when the body names another tenant",
+        "403 from the interceptor without a signed tenant context",
+        "IAM denies another tenant's prefix, KMS context and DynamoDB keys",
+        "404 when another tenant asks for this turn"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Proven on the live stack",
+      "items": [
+        "All 10 isolation checks passed against the deployed sandbox (11 Nov 2026)",
+        "A caller other than the worker refused by the runtime and Gateway resource policies",
+        "A workspace file stayed inside AnyCompany's prefix and was not visible to Example Corp (19 Oct 2026)"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "Designed, not yet seen live",
+      "items": [
+        "The runtime credentials refused outside the VPC"
+      ]
+    }
+  ]
+}

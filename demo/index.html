@@ -1,0 +1,183 @@
+<!doctype html>
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+     SPDX-License-Identifier: MIT-0 -->
+
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Split harness demo</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16191f; --muted: #5f6b7a; --line: #d5dbe3;
+    --accent: #0f6cbd; --ok-bg: #e7f6ec; --ok: #1d6b36; --bad-bg: #fdecea; --bad: #a4262c;
+    --warn-bg: #fff4ce; --warn: #7a5a00; --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1d2128; --text: #e6e9ee; --muted: #9aa5b4; --line: #343b46;
+      --accent: #5aa9f0; --ok-bg: #173a24; --ok: #8fdca6; --bad-bg: #4a1c1f; --bad: #f4a3a6;
+      --warn-bg: #3d3214; --warn: #f0d58a; --code: #262b33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); color: var(--text);
+           display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .meta { color: var(--muted); font-size: 12px; word-break: break-all; }
+  main { padding: 16px 20px; display: grid; gap: 16px; }
+  .tenants { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; }
+  section.panel { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+                  border-radius: 8px; padding: 14px; min-width: 0; }
+  section.panel h2 { font-size: 15px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; word-break: break-all; }
+  textarea { width: 100%; min-height: 64px; resize: vertical; padding: 8px; border-radius: 6px;
+             border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; }
+  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+  button:disabled { opacity: 0.55; cursor: progress; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .presets button { font-size: 12px; padding: 4px 8px; }
+  .log { display: grid; gap: 8px; margin-top: 10px; }
+  .turn { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: var(--bg); color: var(--text); }
+  .turn .q { font-weight: 600; }
+  .turn .a { white-space: pre-wrap; margin-top: 6px; }
+  .turn .foot { color: var(--muted); font-size: 12px; margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px;
+           border: 1px solid var(--line); background: var(--code); color: var(--text); }
+  .badge.ok { background: var(--ok-bg); color: var(--ok); border-color: transparent; }
+  .badge.bad { background: var(--bad-bg); color: var(--bad); border-color: transparent; }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; vertical-align: top; padding: 6px 8px; border-top: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.observed { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-word; }
+  #notice { display: none; padding: 8px 12px; border-radius: 6px; background: var(--warn-bg); color: var(--warn); }
+  #notice.show { display: block; }
+  #notice.error { background: var(--bad-bg); color: var(--bad); }
+  nav.tabs { display: flex; gap: 4px; padding: 0 20px; border-bottom: 1px solid var(--line);
+             background: var(--panel); color: var(--text); }
+  nav.tabs button { border: none; border-bottom: 3px solid transparent; border-radius: 0; padding: 10px 14px;
+                    background: var(--panel); color: var(--muted); }
+  nav.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .tab { display: grid; gap: 16px; }
+  .tab[hidden] { display: none; }
+  .form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; margin: 10px 0; }
+  .form label, .toggles label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  .toggles { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 6px 0 12px; }
+  .toggles label { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text); }
+  input[type="number"] { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line);
+                         background: var(--bg); color: var(--text); font: inherit; }
+  .headline { font-size: 16px; font-weight: 600; margin: 8px 0 12px; }
+  .bars { display: grid; gap: 8px; margin-bottom: 12px; }
+  .bar-row { display: grid; grid-template-columns: 170px 1fr 80px; gap: 10px; align-items: center; font-size: 13px; }
+  .bar-track { display: flex; height: 22px; border-radius: 4px; overflow: hidden; background: var(--code); }
+  .seg { height: 100%; }
+  .seg.inference { background: #6b7a8f; } .seg.runtime { background: #d9822b; } .seg.worker { background: #2b8a3e; }
+  .seg.workerWait { background: #74c69d; } .seg.other { background: #8c6bb1; } .seg.isolation { background: #c2255c; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+  .legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  .facts { display: grid; gap: 4px; margin-top: 10px; font-size: 13px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.total td { font-weight: 600; }
+  .checks-cell { display: flex; flex-wrap: wrap; gap: 4px; }
+  ul.plain { margin: 6px 0 0; padding-left: 18px; }
+  .diagram-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .diagram-list a { color: var(--accent); font-weight: 600; }
+  /* .sub breaks anywhere so long IDs fit; prose in these places should wrap at word boundaries */
+  .diagram-list .sub, #requirements .sub { word-break: normal; overflow-wrap: break-word; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Split harness: one shared agent, two tenants</h1>
+  <div class="meta" id="stack-meta">Reading the stack...</div>
+  <button id="setup" class="primary" type="button">Set up demo tenants</button>
+</header>
+<nav class="tabs" role="tablist" aria-label="Demo sections">
+  <button type="button" role="tab" data-tab="demo" aria-selected="true">Live demo</button>
+  <button type="button" role="tab" data-tab="cost" aria-selected="false">Cost</button>
+  <button type="button" role="tab" data-tab="security" aria-selected="false">Security</button>
+  <button type="button" role="tab" data-tab="diagrams" aria-selected="false">Diagrams</button>
+</nav>
+<main>
+  <div id="notice" role="status"></div>
+  <div class="tab" id="tab-demo" role="tabpanel">
+  <div class="tenants" id="tenants"></div>
+  <section class="panel">
+    <h2>Isolation checks</h2>
+    <div class="sub">Each check runs live against the deployed stack and shows what came back.</div>
+    <div class="row"><button id="run-all" type="button" class="primary">Run all checks</button></div>
+    <table>
+      <thead><tr><th>Check</th><th>Requirement</th><th>Expected</th><th>Observed</th><th>Result</th><th></th></tr></thead>
+      <tbody id="checks"></tbody>
+    </table>
+  </section>
+  </div>
+
+  <div class="tab" id="tab-cost" role="tabpanel" hidden>
+    <section class="panel">
+      <h2>Cost per tenant: all on AgentCore vs the split harness</h2>
+      <div class="sub">An illustrative cost model. Change any assumption and the totals update.</div>
+      <div class="row presets" id="cost-presets"></div>
+      <div class="form" id="cost-form"></div>
+      <div class="toggles">
+        <label><input type="checkbox" id="count_script_time"> Count each script's time in both designs</label>
+        <label><input type="checkbox" id="include_isolation"> Add this repository's isolation boundary to the split</label>
+      </div>
+      <div class="headline" id="cost-headline"></div>
+      <div class="legend" id="cost-legend"></div>
+      <div class="bars" id="cost-bars"></div>
+      <table>
+        <thead><tr><th>Per tenant per month</th><th class="num">All on AgentCore</th><th class="num">Split harness</th></tr></thead>
+        <tbody id="cost-table"></tbody>
+      </table>
+      <div class="facts" id="cost-facts"></div>
+    </section>
+    <section class="panel">
+      <h2>Measured on this stack</h2>
+      <div class="sub">Read-only: the worker Lambda's reports, AgentCore Runtime metrics and turn records, priced at
+        Sydney list rates. This is demo traffic, not a load test: it checks the per-event assumptions, not the share
+        of events that run code.</div>
+      <div class="row"><button id="measure" type="button">Measure the last 24 hours</button></div>
+      <table>
+        <thead><tr><th>What</th><th>Measured</th><th>The model assumes</th></tr></thead>
+        <tbody id="measured"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <div class="tab" id="tab-security" role="tabpanel" hidden>
+    <section class="panel">
+      <h2>Tenant isolation: the eight requirements</h2>
+      <div class="sub">Each row names its controls; the buttons run its checks live against the deployed stack.</div>
+      <div class="row"><button id="security-run-all" class="primary" type="button">Run every check</button></div>
+      <table>
+        <thead><tr><th>#</th><th>Requirement</th><th>How it is met</th><th>Live checks</th></tr></thead>
+        <tbody id="requirements"></tbody>
+      </table>
+      <h2 style="margin-top:14px">Designed, not yet seen live</h2>
+      <ul class="plain" id="not-yet-live"></ul>
+    </section>
+  </div>
+
+  <div class="tab" id="tab-diagrams" role="tabpanel" hidden>
+    <div class="diagram-list" id="diagram-list"></div>
+  </div>
+</main>
+<template id="tenant-template">
+  <section class="panel tenant">
+    <h2 class="name"></h2>
+    <div class="sub ids"></div>
+    <textarea class="message" aria-label="Message to the agent" placeholder="Ask the agent something..."></textarea>
+    <div class="row presets"></div>
+    <div class="row"><button class="send primary" type="button">Send turn</button></div>
+    <div class="log"></div>
+  </section>
+</template>
+<script src="/app.js"></script>
+</body>
+</html>

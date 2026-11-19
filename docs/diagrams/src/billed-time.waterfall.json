@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "diagram_type": "waterfall",
+  "meta": {
+    "title": "Billed compute for one event: all on AgentCore vs the split",
+    "locale": "en",
+    "output": ".archify/waterfall-billed-time-20261019-215913/billed-time.html",
+    "evidence": "illustrative",
+    "unit": "s",
+    "quality_profile": "showcase"
+  },
+  "spans": [
+    {
+      "id": "allon",
+      "name": "All on AgentCore: every event",
+      "service": "AgentCore Runtime microVM",
+      "start": 0,
+      "end": 305,
+      "detail": "Each tenant's microVM runs the whole agent loop and bills memory until its 5-minute idle timeout ends."
+    },
+    { "id": "allon-work", "name": "Agent loop runs, 1 GB", "start": 0, "duration": 5, "parent": "allon" },
+    { "id": "allon-idle", "name": "Idle, 1 GB still billed", "start": 5, "duration": 120, "parent": "allon", "detail": "Runtime v2 reclaims idle memory after 120 seconds." },
+    { "id": "allon-floor", "name": "Idle at the 128 MB floor", "start": 125, "duration": 180, "parent": "allon", "detail": "Billing stops when the 300-second idle timeout ends the session." },
+    {
+      "id": "routine",
+      "name": "Split, routine event (9 in 10)",
+      "service": "Shared Lambda worker",
+      "start": 0,
+      "duration": 5,
+      "detail": "The shared worker answers with the model and Gateway tools. No microVM starts, and billing stops when the turn ends."
+    },
+    {
+      "id": "code",
+      "name": "Split, code event (1 in 10)",
+      "start": 0,
+      "end": 335,
+      "detail": "Only these events start a microVM: the tenant's runtime session runs one script, then idles to its timeout."
+    },
+    {
+      "id": "code-worker",
+      "name": "Worker turn, waits for the script",
+      "service": "Shared Lambda worker",
+      "start": 0,
+      "duration": 35,
+      "parent": "code",
+      "detail": "5 seconds of agent loop plus about 30 seconds waiting for the runtime. The illustrative estimate counts only the 5 seconds."
+    },
+    { "id": "code-run", "name": "Script runs, 1 GB", "service": "AgentCore Runtime microVM", "start": 5, "duration": 30, "parent": "code" },
+    { "id": "code-idle", "name": "Idle, 1 GB still billed", "service": "AgentCore Runtime microVM", "start": 35, "duration": 120, "parent": "code" },
+    { "id": "code-floor", "name": "Idle at the 128 MB floor", "service": "AgentCore Runtime microVM", "start": 155, "duration": 180, "parent": "code" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Why the split costs less",
+      "items": [
+        "A microVM bills for its idle timeout after every event it serves",
+        "All on AgentCore, every event opens that window: 4,320 a month per tenant",
+        "In the split only code events do, about 432 a month; routine events pay seconds of shared Lambda"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Per tenant per month, illustrative estimate",
+      "items": [
+        "Runtime: $3.16 all on AgentCore, $0.43 split",
+        "Shared Lambda worker: $0.29 split only",
+        "Same in both: Nova Lite $0.83, Gateway and state $0.12",
+        "Total: $4.11 against $1.67, 59% less"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Corrections the estimate does not make",
+      "items": [
+        "Count each 30 s script in both designs: $4.24 all on AgentCore, $1.84 split",
+        "Add this repo's isolation boundary to the split: $1.99",
+        "The split still costs 53% less"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "Measured on the sandbox, 19 Oct 2026",
+      "items": [
+        "Worker turns averaged 4.2 s billed over 33 runs, against 5 s assumed",
+        "Turns that used only Gateway tools started no runtime",
+        "The idle runtime kept about 1 GB until the timeout, not 128 MB after 2 minutes"
+      ]
+    }
+  ]
+}
