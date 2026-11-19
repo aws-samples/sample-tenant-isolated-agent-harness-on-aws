@@ -1,0 +1,30 @@
+.venv/
+.build/
+cdk.out/
+cdk.context.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.archify/
+
+# Generated evidence from local demo and simulator runs (committed examples live in docs/evidence/)
+.build/evidence/
+
+# Security-scan and audit output
+*.sarif
+.scannerwork/
+bandit-report.*
+semgrep-report.*
+
+# Local agent and tool config
+.kiro/
+.amazonq/
+.aider*
+.threat-model/
+
+# Pinned CDK CLI install (package.json + package-lock.json are committed)
+node_modules/
+
+# Private patterns for the leak check in scripts/export_public.sh
+.export-denylist

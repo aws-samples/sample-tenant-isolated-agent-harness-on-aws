@@ -1,0 +1,8 @@
+strands-agents==1.64.0
+# Pulled in by strands-agents. 2.2.0 fixes CVE-2026-59951, CVE-2026-116684, CVE-2026-116685 and
+# CVE-2026-116686, which affect 2.1.1 (the version strands-agents 1.61.1 capped it at).
+mcp>=2.2.0
+boto3==1.43.123
+# Pinned to the release without the CA roots in AWS security bulletin 2026-150-AWS. Pulled in
+# transitively; the runtime package ships no certifi and uses botocore's own CA bundle.
+certifi==2026.10.23

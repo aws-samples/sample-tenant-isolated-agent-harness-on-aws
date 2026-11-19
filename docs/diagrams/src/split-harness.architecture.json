@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Split agent harness with tenant isolation",
+    "locale": "en",
+    "output": ".archify/architecture-split-harness-20261019-214634/split-harness.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "routine",
+        "label": "Routine event: no microVM",
+        "focus": ["tenants", "api", "ingress", "queue", "worker", "gateway", "tools", "saas"],
+        "note": "About 9 in 10 events. The shared worker answers with the model and Gateway tools, and no runtime starts."
+      },
+      {
+        "id": "code",
+        "label": "Code event: the tenant's runtime",
+        "focus": ["queue", "worker", "runtime", "bucket"],
+        "note": "About 1 in 10 events. The worker sends one task to the tenant's runtime session, which syncs files under that tenant's prefix."
+      },
+      {
+        "id": "isolation",
+        "label": "Tenant isolation on every hop",
+        "focus": ["api", "ingress", "worker", "gateway", "tools", "saas", "runtime", "bucket"],
+        "note": "The tenant comes from the token, then travels as an STS session tag and a KMS-signed context. IAM checks it at every store."
+      },
+      {
+        "id": "state",
+        "label": "Durable state outside compute",
+        "focus": ["queue", "coord", "worker", "bucket"],
+        "note": "Turn order lives in the FIFO queue, status in DynamoDB and the conversation in S3, so any worker can resume a turn."
+      }
+    ]
+  },
+  "components": [
+    { "id": "tenants", "type": "external", "label": "Trades businesses", "sublabel": "users and events", "pos": [40, 40], "size": [136, 62] },
+    { "id": "api", "type": "security", "label": "HTTP API", "sublabel": "Cognito JWT authorizer", "pos": [290, 40], "size": [136, 62] },
+    { "id": "ingress", "type": "backend", "label": "Ingress Lambda", "sublabel": "tenant from the token", "pos": [540, 40], "size": [136, 62] },
+    { "id": "queue", "type": "messagebus", "label": "SQS FIFO queue", "sublabel": "one lane per tenant", "pos": [790, 40], "size": [136, 62] },
+    { "id": "coord", "type": "database", "label": "Coordination table", "sublabel": "status, idempotency", "pos": [533, 220], "size": [150, 62] },
+    { "id": "worker", "type": "backend", "label": "Strands worker", "sublabel": "Lambda + Nova Lite", "tag": "shared pool", "pos": [758, 215], "size": [200, 72] },
+    { "id": "gateway", "type": "security", "label": "AgentCore Gateway", "sublabel": "IAM + interceptor", "pos": [1090, 220], "size": [150, 62] },
+    { "id": "tools", "type": "backend", "label": "Business tools", "sublabel": "Lambda, tenant ABAC", "pos": [1370, 220], "size": [136, 62] },
+    { "id": "saas", "type": "database", "label": "SaaS table", "sublabel": "DynamoDB, TENANT# keys", "pos": [1370, 400], "size": [136, 62] },
+    { "id": "runtime", "type": "backend", "label": "AgentCore Runtime", "sublabel": "runs one script task", "tag": "per tenant", "pos": [783, 400], "size": [150, 62] },
+    { "id": "bucket", "type": "database", "label": "Tenant bucket", "sublabel": "S3 with SSE-KMS", "tag": "tenant prefixes", "pos": [508, 400], "size": [150, 62] }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "AWS Region (sample: Sydney)",
+      "wraps": ["api", "ingress", "queue", "coord", "worker", "gateway", "tools", "saas", "runtime", "bucket"],
+      "pad": 20
+    },
+    { "kind": "security-group", "label": "Runtime VPC, no inbound", "wraps": ["runtime"], "pad": 14 }
+  ],
+  "connections": [
+    { "id": "sign-in", "from": "tenants", "to": "api", "label": "HTTPS + JWT", "variant": "emphasis" },
+    { "id": "claims", "from": "api", "to": "ingress", "label": "tenant claim", "variant": "emphasis" },
+    { "id": "enqueue", "from": "ingress", "to": "queue", "label": "lane = tenant", "variant": "emphasis" },
+    { "id": "record", "from": "ingress", "to": "coord", "label": "request record" },
+    { "id": "deliver", "from": "queue", "to": "worker", "label": "one turn", "variant": "emphasis" },
+    { "id": "tool-call", "from": "worker", "to": "gateway", "label": "signed tenant ctx", "variant": "security" },
+    { "id": "tool-run", "from": "gateway", "to": "tools", "label": "verified tenant", "variant": "security" },
+    { "id": "items", "from": "tools", "to": "saas", "label": "TENANT# keys only", "variant": "security" },
+    { "id": "state", "from": "worker", "to": "bucket", "label": "tenant session", "variant": "security", "fromSide": "bottom", "toSide": "top" },
+    { "id": "execute", "from": "worker", "to": "runtime", "label": "1 in 10 events", "variant": "dashed" },
+    { "id": "workspace", "from": "runtime", "to": "bucket", "label": "VPC-only creds", "variant": "security" }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Routine event, about 9 in 10",
+      "items": [
+        "The shared worker answers with the model and Gateway tools",
+        "No microVM starts, so no per-tenant compute bills while idle",
+        "Illustrative estimate: $1.67 against $4.11 per tenant-month"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Code event, about 1 in 10",
+      "items": [
+        "The worker sends one complete task, not separate file and process calls",
+        "The tenant's runtime session ends 5 minutes after it goes idle",
+        "Workspace credentials last 15 minutes and work only through the VPC endpoint"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Tenant isolation",
+      "items": [
+        "The tenant comes from the sign-in token, never the request body",
+        "Every data credential carries a TenantId STS session tag",
+        "The Gateway interceptor checks a KMS-signed tenant context",
+        "IAM scopes S3 prefixes, KMS context and DynamoDB leading keys"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "Not drawn",
+      "items": [
+        "The worker also updates the coordination record",
+        "DNS Firewall lets the runtime resolve AWS domains only",
+        "A failed turn retries after 30 s and 2 min, then goes to a dead-letter queue"
+      ]
+    }
+  ]
+}

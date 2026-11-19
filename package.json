@@ -1,0 +1,10 @@
+{
+  "name": "split-harness",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pins the AWS CDK CLI used to deploy this sample. The app itself is Python (see cdk.json).",
+  "license": "MIT-0",
+  "devDependencies": {
+    "aws-cdk": "2.1148.0"
+  }
+}
