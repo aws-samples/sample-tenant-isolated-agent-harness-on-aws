@@ -131,6 +131,38 @@ def test_run_task_persists_workspace_to_the_tenant_prefix_only(tmp_path, tenants
     assert again["stdout"].strip() == "done" and again["workspace"]["pulled"] == 0
 
 
+def test_a_path_the_data_key_refuses_is_left_out_without_stopping_the_sync(tmp_path, tenants):
+    """The data key's policy refuses an object whose key names the tenant's prefix again further down
+    (infra/policies.py s3_object_context). The sync leaves such a file out, so later tasks still sync."""
+    from fnmatch import fnmatchcase
+
+    from infra import policies
+    a = tenants["anycompany-plumbing"]
+    condition = policies.s3_object_context(region="ap-southeast-2", key_prefixes=policies.TENANT_KEY_PREFIXES)
+    like, not_like = ([p.replace(policies.T, a) for p in condition[op][policies.S3_ARN_CONTEXT]]
+                      for op in ("StringLike", "StringNotLike"))
+
+    class KeyPolicyFakeS3(ScopedFakeS3):
+        def _check(self, bucket, key):
+            super()._check(bucket, key)
+            arn = f"arn:aws:s3:::{bucket}/{key}"
+            if not key.endswith("/") and (not any(fnmatchcase(arn, p) for p in like)
+                                          or any(fnmatchcase(arn, p) for p in not_like)):
+                raise PermissionError(f"AccessDenied from the key policy: {key}")
+
+    workspace = tenancy.Layout.workspace_prefix(a)
+    s3 = KeyPolicyFakeS3("tenant-bucket", [workspace])
+    s3.objects[workspace + f"old/transfer/{a}/x.json"] = b"written before the key condition existed"
+    nested = f"tenants/{a}/notes.txt"
+    script = f'mkdir -p "$WORKSPACE_DIR/tenants/{a}"; echo x > "$WORKSPACE_DIR/{nested}"; echo y > "$WORKSPACE_DIR/ok.txt"'
+    first = server.run_task(make_task(a, script=script), session_root=tmp_path, s3_factory=lambda ws: s3)["result"]
+    assert first["workspace"] == {"pulled": 0, "uploaded": 1, "deleted": 0, "notSaved": [nested]}
+    assert set(s3.objects) == {workspace + "ok.txt", workspace + f"old/transfer/{a}/x.json"}
+    again = server.run_task(make_task(a, script='echo z > "$WORKSPACE_DIR/more.txt"'),
+                            session_root=tmp_path, s3_factory=lambda ws: s3)["result"]
+    assert again["exitCode"] == 0 and again["workspace"]["uploaded"] == 1 and again["workspace"]["deleted"] == 0
+
+
 def test_a_compromised_workspace_listing_cannot_reach_other_tenants(tmp_path, tenants):
     a, b = tenants.values()
     s3 = ScopedFakeS3("tenant-bucket", [tenancy.Layout.workspace_prefix(b)])  # credentials for B only

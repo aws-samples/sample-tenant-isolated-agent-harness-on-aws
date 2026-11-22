@@ -35,6 +35,9 @@ MAX_HOURS = 24                       # one-minute metric resolution over the win
 MAX_LOG_EVENTS = 5000
 MAX_TURNS = 5000
 MODEL_WORKER_SECONDS = 5             # the cost model's assumption per turn
+# The coordination-table attributes the turn count reads. The demo operator role may scan these and
+# nothing else (MeasureCountTurns in infra/stack.py), so the scan never returns reply text or errors.
+TURN_SCAN_ATTRIBUTES = ("pk", "sk", "state", "toolTrace", "updatedAt")
 REPORT_TEXT = re.compile(r"Billed Duration: (?P<billed>\d+) ms.*?Max Memory Used: (?P<mem>\d+) MB(?P<init>.*Init Duration)?")
 
 
@@ -180,7 +183,8 @@ def _metric_series(cloudwatch: Any, queries: dict, start: float, end: float) -> 
 
 def _turns(dynamodb: Any, table: str, since: float) -> dict:
     counts = {"completed": 0, "gatewayOnly": 0, "ranCode": 0, "modelOnly": 0, "notCompleted": 0}
-    kwargs = {"TableName": table, "FilterExpression": "begins_with(sk, :req) AND updatedAt >= :since",
+    kwargs = {"TableName": table, "Select": "SPECIFIC_ATTRIBUTES",
+              "FilterExpression": "begins_with(sk, :req) AND updatedAt >= :since",
               "ProjectionExpression": "#st, toolTrace, updatedAt", "ExpressionAttributeNames": {"#st": "state"},
               "ExpressionAttributeValues": {":req": {"S": "REQ#"}, ":since": {"N": str(int(since))}}}
     seen = 0

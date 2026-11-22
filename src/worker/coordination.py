@@ -1,12 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Coordination records in DynamoDB: request status, idempotency and a fenced tenant lease.
+"""Coordination records in DynamoDB: request status, idempotency and a per-tenant lease.
 
 The FIFO message group already serialises turns per tenant. The lease is a second guard: if a
 visibility timeout expires while a turn is still running, the redelivered copy cannot start a
-concurrent turn for the same tenant. The fence counter grows on every acquisition so downstream
-writers can reject a stale holder.
+concurrent turn for the same tenant. A fence counter grows on every acquisition and is recorded on
+the request; no writer checks it yet, so it does not yet reject a stale holder.
 
 The table holds small control-plane records only. Conversation history, workspace files and
 SaaS data live behind tenant-scoped sessions; the final reply text is kept here (bounded) so

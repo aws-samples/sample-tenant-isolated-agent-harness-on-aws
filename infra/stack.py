@@ -73,11 +73,23 @@ OPERATION_KEY_DOC = "Set by the harness from requestId and toolUseId so a retrie
 
 def asset_dir(relative: str) -> str:
     path = BUILD / relative
+    allow_placeholder = os.environ.get("SPLIT_HARNESS_ALLOW_PLACEHOLDER_ASSETS") == "1"
+    marker = path / "PLACEHOLDER"
     if not path.exists():
-        if os.environ.get("SPLIT_HARNESS_ALLOW_PLACEHOLDER_ASSETS") != "1":
+        if not allow_placeholder:
             raise RuntimeError(f"{path} is missing: run scripts/build_assets.sh before synth or deploy")
         path.mkdir(parents=True, exist_ok=True)
-        (path / "PLACEHOLDER").write_text("synth-only placeholder; run scripts/build_assets.sh before deploy\n")
+        marker.write_text("synth-only placeholder; run scripts/build_assets.sh before deploy\n")
+        return str(path)
+    # The directory exists but is not a real build: it still carries the synth-only placeholder
+    # marker (left by a test run, which sets SPLIT_HARNESS_ALLOW_PLACEHOLDER_ASSETS=1), or it is
+    # empty (a build_assets.sh run that stopped before it populated the directory, e.g. a pip
+    # failure after its rm/mkdir). build_assets.sh produces a populated, markerless directory, so
+    # refuse anything else rather than ship a non-working layer and runtime.
+    if not allow_placeholder and (marker.exists() or not any(path.iterdir())):
+        raise RuntimeError(
+            f"{path} is not a built asset (empty or placeholder only): run scripts/build_assets.sh "
+            f"before synth or deploy")
     return str(path)
 
 
@@ -153,6 +165,16 @@ class SplitHarnessStack(Stack):
         # Only a throwaway sandbox (-c sandbox=true) deletes them, and only there does the bucket
         # empty itself through CDK's auto-delete function.
         sandbox = str(ctx("sandbox") or "").lower() in ("1", "true", "yes")
+        # Demo mode grants the demo operator role pool-wide Cognito admin, so it can act as any
+        # tenant through the API. That belongs only in a throwaway sandbox account with demo data,
+        # so demo mode requires sandbox mode: any value that turns demo on (parsed above) must be
+        # paired with -c sandbox=true, which deletes tenant data, its key and the user pool with the
+        # stack. Enforced here so the documented rule is a check, not just prose.
+        if demo and not sandbox:
+            raise ValueError(
+                "demo mode (-c demo=true) must run only in a throwaway sandbox account: add "
+                "-c sandbox=true. Demo mode implies sandbox mode, so tenant data, its key and the "
+                "user pool are deleted with the stack.")
         data_removal = RemovalPolicy.DESTROY if sandbox else RemovalPolicy.RETAIN
 
         # ---------------------------------------------------------------- tenant data plane
@@ -238,7 +260,7 @@ class SplitHarnessStack(Stack):
         basic = iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole")
         ingress_role = iam.Role(self, "IngressRole", assumed_by=lambda_trust, managed_policies=[basic])
         worker_role = iam.Role(self, "WorkerRole", assumed_by=lambda_trust, managed_policies=[basic],
-                               description="Shared harness: no tenant data access of its own")
+                               description="Shared harness: its only data store is the coordination table")
         interceptor_role = iam.Role(self, "InterceptorRole", assumed_by=lambda_trust, managed_policies=[basic])
         tools_fn_role = iam.Role(self, "ToolsFunctionRole", assumed_by=lambda_trust, managed_policies=[basic])
 
@@ -249,13 +271,17 @@ class SplitHarnessStack(Stack):
         tools_role = self._tenant_role("TenantToolsRole", tools_fn_role,
                                        "Tenant-scoped SaaS data access for Gateway tools")
 
-        # The person running the demo assumes this scoped role instead of their own admin role, so
-        # the sample never asks a reader to grant themselves break-glass. Created only with
-        # -c demo=true. Its permissions are attached once the resources it touches exist.
+        # The person running the demo assumes this role instead of their own admin role, so the sample
+        # never asks a reader to grant themselves break-glass. Created only with -c demo=true, which is
+        # for a sandbox account holding demo data only: any principal in the account allowed to assume
+        # it can use it. Its tenant data access is limited to the demo's own two tenants; its Cognito
+        # admin grant and its coordination-table scan cannot be limited that way (see the README).
+        # Its permissions are attached once the resources it touches exist.
         demo_operator_role = iam.Role(
             self, "DemoOperatorRole", assumed_by=iam.AccountRootPrincipal(),
             max_session_duration=Duration.hours(1),
-            description="Least-privilege role for running the demo") if demo else None
+            description="Demo operator: the demo's two tenants only (sandbox accounts with demo data)") if demo else None
+        demo_storage_ids = self._demo_storage_ids() if demo else []
 
         # Bucket backstop: tenant objects and listings only through the tenant roles; the bucket policy
         # and data-handling settings only through CloudFormation deployments (plus optional break-glass).
@@ -265,18 +291,21 @@ class SplitHarnessStack(Stack):
                 deployer_role_arns=self._deployment_role_arns(),
                 admin_role_arns=admin_roles,
                 cleanup_role_arns=self._auto_delete_role_arns(),
-                demo_operator_role_arns=[demo_operator_role.role_arn] if demo_operator_role else []):
+                demo_operator_role_arns=[demo_operator_role.role_arn] if demo_operator_role else [],
+                demo_tenant_prefixes=[f"tenants/{sid}/" for sid in demo_storage_ids]):
             bucket.add_to_resource_policy(iam.PolicyStatement.from_json(statement))
 
         # The data key is usable only through S3, and only by the tenant roles (the SSE-KMS requester
-        # is the tenant role). The HMAC key mints only through the worker and verifies only through
-        # the interceptor, so holding kms:GenerateMac in an IAM policy is not enough to forge a
-        # tenant context. Break-glass roles may read tenant objects (Decrypt through S3).
+        # is the tenant role), each for its own tenant's prefixes (policies.s3_object_context): S3
+        # IAM prefix scoping is the first lock, this is the second. The HMAC key mints only through
+        # the worker and verifies only through the interceptor, so holding kms:GenerateMac in an IAM
+        # policy is not enough to forge a tenant context. Break-glass roles may read tenant objects.
         mac = {"StringEquals": {"kms:MacAlgorithm": "HMAC_SHA_256"}}
-        via_s3 = {"StringEquals": {"kms:ViaService": f"s3.{self.region}.amazonaws.com"}}
-        crypto = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"]
+        # No kms:DescribeKey: it carries no encryption context, so the condition could never allow it.
+        crypto = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"]
         data_key.add_to_resource_policy(iam.PolicyStatement(
-            sid="TenantRolesUseThroughS3", actions=crypto, resources=["*"], conditions=via_s3,
+            sid="TenantRolesUseThroughS3", actions=crypto, resources=["*"],
+            conditions=policies.s3_object_context(region=self.region, key_prefixes=policies.TENANT_KEY_PREFIXES),
             principals=[iam.ArnPrincipal(harness_role.role_arn), iam.ArnPrincipal(runtime_tenant_role.role_arn)]))
         token_key.add_to_resource_policy(iam.PolicyStatement(
             sid="WorkerMintsTenantContext", actions=["kms:GenerateMac"], resources=["*"], conditions=mac,
@@ -531,24 +560,37 @@ class SplitHarnessStack(Stack):
                                           **invokers))
 
         if demo_operator_role is not None:
-            # It can set the demo up and read the bucket to show isolation, and it may ATTEMPT
-            # InvokeAgentRuntime and InvokeGateway so the live run proves the resource policies refuse
-            # a caller that is neither the worker nor a break-glass role. It is not in adminRoleArns.
+            # It can set the demo up and read the demo tenants' objects to show isolation, and it may
+            # ATTEMPT InvokeAgentRuntime and InvokeGateway so the live run proves the resource policies
+            # refuse a caller that is neither the worker nor a break-glass role. It is not in
+            # adminRoleArns. Its S3, KMS and SaaS-table grants name the demo's two tenants only.
+            from demo.measured import TURN_SCAN_ATTRIBUTES  # the Cost tab's turn count reads only these
             demo_operator_role.add_to_policy(iam.PolicyStatement(
                 sid="ReadStackOutputs", actions=["cloudformation:DescribeStacks"], resources=[self.stack_id]))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
+                # Cognito has no condition key for a user's attributes, so this covers every user in
+                # the pool: the role can create a user in any tenant and sign in as it.
                 sid="SeedAndAuthenticateDemoUsers", resources=[user_pool.user_pool_arn],
                 actions=["cognito-idp:AdminCreateUser", "cognito-idp:AdminSetUserPassword",
-                         "cognito-idp:AdminInitiateAuth", "cognito-idp:AdminGetUser", "cognito-idp:AdminDeleteUser"]))
+                         "cognito-idp:AdminInitiateAuth"]))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
                 sid="SeedDemoSaasData", resources=[saas.table_arn],
                 actions=["dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:DeleteItem",
-                         "dynamodb:GetItem", "dynamodb:Query", "dynamodb:DescribeTable"]))
+                         "dynamodb:GetItem", "dynamodb:Query"],
+                conditions={"ForAllValues:StringEquals": {
+                                "dynamodb:LeadingKeys": [f"TENANT#{sid}" for sid in demo_storage_ids]},
+                            "Null": {"dynamodb:LeadingKeys": "false"}}))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
-                # Read-only, exact-key only: the replay check reads back its own turn's record to show
-                # the worker ran it once (attempts == 1).
+                # DescribeTable names no partition: the ABAC check reads the table's ARN with it.
+                sid="DescribeSaasTable", resources=[saas.table_arn], actions=["dynamodb:DescribeTable"]))
+            demo_operator_role.add_to_policy(iam.PolicyStatement(
+                # Read-only, in the demo tenants' partitions only: the replay check reads back its own
+                # turn's record to show the worker ran it once (attempts == 1).
                 sid="ReadCoordinationForReplayCheck", resources=[coordination.table_arn],
-                actions=["dynamodb:GetItem"]))
+                actions=["dynamodb:GetItem"],
+                conditions={"ForAllValues:StringEquals": {
+                                "dynamodb:LeadingKeys": [f"TENANT#{sid}" for sid in demo_storage_ids]},
+                            "Null": {"dynamodb:LeadingKeys": "false"}}))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
                 # Read-only: the DNS-block check reads the runtime VPC's firewall rule group to show its
                 # catch-all rule is BLOCK. The demo model refuses to run a script that reaches the network,
@@ -557,9 +599,11 @@ class SplitHarnessStack(Stack):
                 actions=["route53resolver:ListFirewallRules",
                          "route53resolver:ListFirewallRuleGroupAssociations"], resources=["*"]))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
-                sid="SeedAndInspectTenantObjects", actions=["s3:ListBucket", "s3:GetObject", "s3:PutObject",
-                                                            "s3:DeleteObject"],
-                resources=[bucket.bucket_arn, bucket.arn_for_objects("*")]))
+                sid="SeedAndInspectDemoTenantObjects", actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                resources=[bucket.arn_for_objects(f"tenants/{sid}/*") for sid in demo_storage_ids]))
+            demo_operator_role.add_to_policy(iam.PolicyStatement(
+                sid="ListDemoTenantPrefixes", actions=["s3:ListBucket"], resources=[bucket.bucket_arn],
+                conditions={"StringLike": {"s3:prefix": [f"tenants/{sid}/*" for sid in demo_storage_ids]}}))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
                 sid="SimulateTenantRolePolicies", actions=["iam:SimulatePrincipalPolicy"],
                 resources=[harness_role.role_arn, runtime_tenant_role.role_arn, tools_role.role_arn]))
@@ -581,14 +625,21 @@ class SplitHarnessStack(Stack):
                 resources=[f"arn:{self.partition}:logs:{self.region}:{self.account}:log-group:"
                            f"{worker_fn.log_group.log_group_name}"]))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
-                sid="MeasureCountTurns", actions=["dynamodb:Scan"], resources=[coordination.table_arn]))
+                # A scan cannot be held to partitions, so it covers every tenant's turn records. It may
+                # return only what the Cost tab counts (state, tool names, time), never reply text or errors.
+                sid="MeasureCountTurns", actions=["dynamodb:Scan"], resources=[coordination.table_arn],
+                conditions={"ForAllValues:StringEquals": {"dynamodb:Attributes": list(TURN_SCAN_ATTRIBUTES)},
+                            "StringEquals": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"},
+                            "Null": {"dynamodb:Attributes": "false"}}))
             demo_operator_role.add_to_policy(iam.PolicyStatement(
                 # GetMetricData has no resource type for standard metrics, so it is held to this Region.
                 sid="MeasureReadRuntimeMetrics", actions=["cloudwatch:GetMetricData"], resources=["*"],
                 conditions={"StringEquals": {"aws:RequestedRegion": self.region}}))
             data_key.add_to_resource_policy(iam.PolicyStatement(
-                sid="DemoOperatorSeedsThroughS3", actions=["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
-                resources=["*"], conditions=via_s3, principals=[iam.ArnPrincipal(demo_operator_role.role_arn)]))
+                sid="DemoOperatorSeedsThroughS3", actions=["kms:Decrypt", "kms:GenerateDataKey*"],
+                resources=["*"], principals=[iam.ArnPrincipal(demo_operator_role.role_arn)],
+                conditions=policies.s3_object_context(
+                    region=self.region, key_prefixes=[f"tenants/{sid}/" for sid in demo_storage_ids])))
 
         for name, value in {
             "ApiUrl": api.api_endpoint, "UserPoolId": user_pool.user_pool_id,
@@ -606,6 +657,12 @@ class SplitHarnessStack(Stack):
             CfnOutput(self, name, value=value)
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _demo_storage_ids() -> list[str]:
+        """Storage IDs of the demo's own tenants (demo/client.py), the only ones its operator touches."""
+        from demo.client import TENANTS, Demo
+        return [Demo.storage_id(tenant) for tenant in TENANTS]
+
     def _tenant_role(self, role_id: str, caller: iam.IRole, description: str) -> iam.Role:
         principal = iam.PrincipalWithConditions(iam.SessionTagsPrincipal(caller), policies.tenant_trust_conditions())
         return iam.Role(self, role_id, assumed_by=principal, max_session_duration=Duration.hours(1),

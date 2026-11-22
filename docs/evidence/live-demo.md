@@ -4,15 +4,15 @@
 > stack name replaced by the sample's default, `SplitHarness`; a fresh `python -m demo.run_demo`
 > writes to `.build/evidence/live-demo.md` and leaves this committed copy in place.
 
-Run at 2026-11-11 09:31 UTC against stack `SplitHarness` in ap-southeast-2, by `python -m demo.run_demo`.
+Run at 2026-11-20 03:54 UTC against stack `SplitHarness` in ap-southeast-2, by `python -m demo.run_demo`.
 
 ## Turns
 
 | Tenant | Message | State | Path | Seconds | Result (first 300 characters) |
 | --- | --- | --- | --- | --- | --- |
-| anycompany-plumbing | Which jobs are open? | COMPLETED | model only | 8.0 | Here are the open jobs: 1. Job ID: J7, Title: Hot water system replacement, 14 Rose St 2. Job ID: J9, Title: Leaking mixer tap, 88 Hill Ave  If you need more information about any of these jobs, please let me know. |
-| anycompany-plumbing | uploads/prices.csv is our supplier price list. It has a header row and the columns sku, description, unit_price_aud. Add up the unit_price_aud column and tell me the total. | COMPLETED | runtime session started | 16.9 | The total sum of the 'unit_price_aud' column in the 'uploads/prices.csv' file is AUD 1652.30. |
-| example-corp-electrical | Create a quote for job E1: switchboard upgrade, $640. | COMPLETED | Gateway tools only | 4.7 | <response>The quote for job E1: switchboard upgrade has been successfully created with the quote ID cbf3abb7712f. The amount for this quote is $640.</response> |
+| anycompany-plumbing | Which jobs are open? | COMPLETED | model only | 7.4 | Here are the open jobs: 1. Job ID: J7, Title: Hot water system replacement, 14 Rose St 2. Job ID: J9, Title: Leaking mixer tap, 88 Hill Ave  If you need more information about any of these jobs, please let me know. |
+| anycompany-plumbing | uploads/prices.csv is our supplier price list. It has a header row and the columns sku, description, unit_price_aud. Add up the unit_price_aud column and tell me the total. | COMPLETED | runtime session started | 21.2 | The total sum of the 'unit_price_aud' column in the 'uploads/prices.csv' file is AUD 1652.30. |
+| example-corp-electrical | Create a quote for job E1: switchboard upgrade, $640. | COMPLETED | Gateway tools only | 4.7 | <response>The quote for job E1: switchboard upgrade has been successfully created with the quote ID befbe1efb391. The amount for this quote is $640.</response> |
 
 ## Isolation checks
 

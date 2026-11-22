@@ -95,7 +95,7 @@ def build_cases(account: str) -> list[dict]:
         case("tools A queries its own partition", tools, "dynamodb:Query", table, {**as_a, "dynamodb:LeadingKeys": [f"TENANT#{A}"]}),
         case("tools A queries tenant B's partition", tools, "dynamodb:Query", table, {**as_a, "dynamodb:LeadingKeys": [f"TENANT#{B}"]}, "implicitDeny"),
         case("tools A scans the whole table", tools, "dynamodb:Scan", table, as_a, "implicitDeny"),
-        # Shared worker role: no tenant data of its own
+        # Shared worker role: no S3 or Gateway access of its own (its one data store is the coordination table)
         case("worker reads any tenant object directly", worker, "s3:GetObject", f"{bucket}/tenants/{A}/harness/session/{A}/scopes/agent/harness/snapshots/snapshot_latest.json", expect="implicitDeny"),
         case("worker calls the Gateway with its own role", worker, "bedrock-agentcore:InvokeGateway", gateway, expect="implicitDeny"),
         case("worker vends a tenant harness session", worker, "sts:AssumeRole", role("TenantHarnessRole")),

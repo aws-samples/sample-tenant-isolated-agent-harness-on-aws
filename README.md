@@ -25,7 +25,7 @@ Two more diagrams, one turn's isolation checks in order and the billed compute p
 | Authenticated ingress | `src/ingress/handler.py` | Cognito JWT for users, SigV4 for system events; tenant from the token, not the body |
 | SQS FIFO, one lane per tenant | `infra/stack.py` (`TurnQueue`) | Message group = tenant hash; tenant-qualified dedup IDs; only ingress may send |
 | Shared Strands harness worker | `src/worker/handler.py`, `src/worker/agent.py` | One message = one turn; snapshot session state per tenant in S3 |
-| Request status, idempotency, lease | `src/worker/coordination.py` | Fenced per-tenant lease in DynamoDB |
+| Request status, idempotency, lease | `src/worker/coordination.py` | Per-tenant lease in DynamoDB; its fence counter is recorded but not yet checked |
 | Direct tool path | `src/worker/gateway_client.py`, `src/tools/handler.py` | SigV4 MCP calls to an IAM-authenticated Gateway; model-safe tool aliases |
 | Tenant context on tool calls | `src/shared/tenant_token.py`, `src/interceptor/handler.py` | KMS HMAC token verified by a Gateway REQUEST interceptor |
 | Lazy execution path | `src/worker/execute_process.py`, `src/runtime/` | One complete script per call; inline or object-scoped S3 transport |
@@ -110,7 +110,7 @@ Context options:
 | `modelId` | `amazon.nova-lite-v1:0` | In-Region Bedrock model (IAM is pinned to it). A cross-Region profile such as `apac.amazon.nova-lite-v1:0` doubles the per-minute quota but leaves the Region |
 | `adminRoleArns` | none | Break-glass roles allowed past the bucket, runtime and Gateway policies |
 | `eventProducerRoleArns` | none | Full role ARNs (account included) allowed to post system events to `POST /events` |
-| `eventTurnTools` | `scoped` | `all` lets event turns create quotes and run scripts; `scoped` denies both |
+| `eventTurnTools` | `scoped` | `all` lets event turns create quotes and run scripts; `scoped` denies both on the event turn itself (the stored text still reaches the tenant's next user turn) |
 | `dnsFirewallMode` | `BLOCK` | `ALERT` resolves every name and only logs, to find a missing name (synth warning) |
 | `modelRequestsPerMinute` | `200` | Model request quota the worker cap is derived from (in-Region Nova Lite; `400` cross-Region) |
 | `modelCallsPerTurn` | `3` | Model calls a turn, used with the quota to size worker concurrency |
@@ -118,17 +118,19 @@ Context options:
 | `maxOpenRequests` | `20` | Requests one tenant may have queued or running; more get HTTP 429 |
 | `apiRateLimit` / `apiBurstLimit` | `50` / `100` | API stage throttling, requests per second and burst |
 | `s3PrefixListId` | looked up | S3 managed prefix list for runtime egress |
-| `demo` | `false` | `true` adds a demo-only Cognito client and a scoped operator role for the demo driver |
+| `demo` | `false` | `true` adds a demo-only Cognito client and an operator role for the demo driver; requires `-c sandbox=true` (demo mode implies sandbox mode) and is for a sandbox account with demo data only (see [Demo](#demo)) |
 | `runtimePlatformVersion` | `V2` | AgentCore Runtime platform version |
 | `availabilityZones` | CDK picks 2 | AZ names for the runtime VPC; set them where only some AZ IDs offer AgentCore (e.g. us-east-1) |
 
 ## Try it
 
-Values in angle brackets come from the stack outputs. Deploy with `-c demo=true` for this
-walkthrough: admin-password sign-in needs the demo client, and writing to a tenant prefix needs a
+Values in angle brackets come from the stack outputs. Deploy with `-c demo=true -c sandbox=true` for
+this walkthrough (demo mode requires sandbox mode): admin-password sign-in needs the demo client, and writing to a tenant prefix needs a
 principal the bucket and KMS policies let in. Your own role is not one of them, so the walkthrough
-seeds the demo data as the stack's scoped operator role (`DemoOperatorRoleArn`), the role the
-[demo](#demo) uses, and you do not grant yourself break-glass.
+seeds the demo data as the stack's demo operator role (`DemoOperatorRoleArn`), the role the
+[demo](#demo) uses, and you do not grant yourself break-glass. Its S3 and SaaS-table grants cover only
+the demo's two tenants: AnyCompany Plumbing, used here, and Example Corp Electrical (the
+[Demo](#demo) section lists what else it can reach).
 
 ```bash
 export AWS_REGION=ap-southeast-2
@@ -147,7 +149,7 @@ TOKEN=$(aws cognito-idp admin-initiate-auth --user-pool-id <UserPoolId> --client
   --query AuthenticationResult.IdToken --output text)
 
 # Demo data: a job in the tenant's partition and the sample upload in its uploads prefix, written as
-# the scoped operator role. The subshell keeps the role's credentials out of your own shell.
+# the demo operator role. The subshell keeps the role's credentials out of your own shell.
 (
   read -r AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN < <(aws sts assume-role \
     --role-arn <DemoOperatorRoleArn> --role-session-name try-it \
@@ -180,11 +182,24 @@ lowercase letter, a digit and a symbol).
 ## Demo
 
 `demo/` drives the deployed stack as two trades businesses, AnyCompany Plumbing and Example Corp
-Electrical, through the same public API a real client uses. Deploy with `-c demo=true`: that adds a
-demo-only Cognito client (admin password sign-in) and a least-privilege operator role. The demo
+Electrical, through the same public API a real client uses. Deploy with `-c demo=true -c sandbox=true`
+(demo mode requires sandbox mode): that adds a
+demo-only Cognito client (admin password sign-in) and an operator role for the demo. The demo
 assumes that role rather than your own, so you are not asked to grant yourself break-glass. It
 creates one Cognito user per tenant, seeds their jobs and price lists, reads the stack outputs, and
 runs the isolation checks.
+
+> **Sandbox accounts with demo data only.** Deploy with `-c demo=true -c sandbox=true` only in such
+> an account; synth refuses `-c demo=true` without `-c sandbox=true`, since demo mode implies sandbox
+> mode (tenant data, its key and the user pool are deleted with the stack). Any
+> principal in the account that is allowed to assume the operator role can use it. Its S3, KMS,
+> SaaS-table and coordination-item grants, and the bucket policy's exemption for it, cover the two
+> demo tenants only. Three grants cannot be narrowed that way: it can create, sign in as and change
+> the password of any user in the user pool, so it can create a user in any tenant and act as that
+> tenant through the API; it can scan the coordination table, which returns every tenant's turn
+> states, tool names and times (not reply text or errors); and it can read the worker's logs, which
+> hold error details from every tenant's turns. The runtime and Gateway resource policies refuse it,
+> which the checks below rely on.
 
 ```bash
 .venv/bin/python -m demo.app --profile <profile>     # then open http://127.0.0.1:8770/
@@ -278,9 +293,11 @@ Two things to know:
 | Runtime process isolation is within a tenant's own session | A script could affect a later script in the **same** tenant's session; no cross-tenant reach | Interim: the runtime stops stray processes between tasks (`src/runtime/server.py`). Full fix: deploy the runtime as a container image with per-task isolation |
 | The model request rate is the binding quota | In-Region Nova Lite serves about 66 turns a minute per account and Region, so this caps throughput well before the isolation primitives do | Request a quota increase, use the cross-Region profile, or shard tenants across accounts and Regions |
 | Single Region | No multi-Region failover | Deploy the stack per Region and route tenants to one |
-| Recovery is partial | Fenced leases, a watchdog and a dead-letter consumer exist; heartbeats for long turns, redrive tooling and fault-injection tests do not | Add them before production load |
+| Recovery is partial | A per-tenant lease (its fence counter is recorded, not yet checked), a watchdog and a dead-letter consumer exist; heartbeats for long turns, redrive tooling and fault-injection tests do not | Add them before production load |
 | Session storage is in Preview | A reset re-hydrates the workspace from S3 (only the warm-start speed-up is lost) | Track the service's GA and limits |
 | Replay-safe side effects cover the demo tool only | Only `create_quote` carries an operation key and ledger | Give every mutating tool the same contract |
+| Prompt injection | A message, upload or tool result can steer the agent inside its own tenant: it cannot change the tenant, but it can misuse that tenant's tools ([threat model](docs/tenant-isolation.md#threat-model)) | Add confirmation steps for irreversible tools, Bedrock Guardrails and model invocation logging |
+| Production hardening is the adopter's | The sample has no dependency scanning, artifact signing, drift detection, GuardDuty or Inspector, compliance mapping, data classification or incident plan. WAF cannot attach to an HTTP API | Supply these in the account and pipeline that run it; for WAF, put a CloudFront distribution in front of the API and attach WAF there, and then either [disable the API's default `execute-api` endpoint](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-disable-default-endpoint.html) and use a custom domain, or have the origin require a header that only your CloudFront sends, so a caller cannot reach the API directly and skip the WAF |
 
 ## Status
 

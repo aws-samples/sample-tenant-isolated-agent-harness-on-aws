@@ -9,13 +9,15 @@ isolation boundary between tenants.
 
 Every tenant data access runs on short-lived credentials that carry the tenant's storage ID as
 an STS session tag (`TenantId`). The IAM policies reference `${aws:PrincipalTag/TenantId}` in S3
-key ARNs, KMS encryption-context conditions and DynamoDB leading keys. A credential minted for
-tenant A cannot reach tenant B's objects, items or keys, even if application code builds the
-wrong key. The same three tenant roles serve every tenant, so nothing in IAM grows with the
-tenant count.
+key ARNs, KMS encryption-context conditions and DynamoDB leading keys, and the data key's own
+policy repeats the encryption-context check. A credential minted for tenant A cannot reach tenant
+B's objects, items or keys, even if application code builds the wrong key. The same three tenant
+roles serve every tenant, so nothing in IAM grows with the tenant count.
 
-The shared harness role itself holds no tenant data access. It can only mint tenant-scoped
-sessions, call the pinned model and invoke the execution runtime.
+The shared harness role reads its turns from the queue, and its one data store is the
+coordination table: each request's status and, once a turn completes, its reply text and the names
+of the tools it used. Beyond that it can only mint tenant-scoped sessions, call the pinned model and
+invoke the execution runtime.
 
 **The one change from the usual pattern: the permanent workspace does not use a shared S3 Files
 mount.** AgentCore mounts a bring-your-own S3 Files access point "into every session at the path
@@ -31,15 +33,16 @@ What was verified, without deploying anything:
 
 | Check | Result |
 | --- | --- |
-| Unit, integration and template tests (`pytest`) | 285 passed |
+| Unit, integration and template tests (`pytest`) | 316 passed |
 | IAM policy simulator on the exact deployed policy documents | 49 of 49 cases matched ([evidence](evidence/iam-simulation.md)) |
 | `cdk synth` and `cfn-lint` on the full stack (95 resources) | Clean, apart from 7 W3005 "redundant DependsOn" warnings from CDK constructs |
 | Runtime package served on 127.0.0.1: `/ping`, session check | `Healthy`; a task without a matching session header got 403 |
 
-Deployed and run live in ap-southeast-2, first on 19 October 2026 and most recently on 11 November
+Deployed and run live in ap-southeast-2, first on 19 October 2026 and most recently on 20 November
 2026: all ten isolation checks pass, and the Gateway header pass-through, the runtime's
-endpoint-bound access from inside its network, the workspace round trip through S3, and the
-runtime and Gateway resource policies refusing a caller other than the worker are now proven.
+endpoint-bound access from inside its network, the workspace round trip through S3, the runtime
+and Gateway resource policies refusing a caller other than the worker, the demo operator role's
+limits and the data key's per-tenant context check are now proven.
 Still not observed live: the same credentials being refused outside the runtime's network. See
 [Live results](#live-results).
 
@@ -48,7 +51,7 @@ Still not observed live: the same credentials being refused outside the runtime'
 | # | Requirement | How it is met | Proof |
 | --- | --- | --- | --- |
 | 1 | Event to Lambdas | Cognito JWT for users, SigV4 plus a producer allowlist for system events, queue policy, tenant-ordered FIFO | `tests/test_ingress.py`, `tests/test_stack.py` |
-| 2 | Harness Lambda to S3 (session state) | Per-turn `TenantHarnessRole` session; prefix ARNs plus KMS encryption context; bucket backstop | Simulator cases 1 to 11, 24 and 32; `tests/test_worker_turn.py` |
+| 2 | Harness Lambda to S3 (session state) | Per-turn `TenantHarnessRole` session; prefix ARNs plus KMS encryption context; bucket backstop | Simulator cases 1 to 11, 24 and 32 (the roles' IAM policies); the data key policy's context check in `tests/test_stack.py`; `tests/test_worker_turn.py` |
 | 3 | Harness Lambda to Gateway | IAM inbound auth, Gateway resource policy, KMS-signed tenant context verified by a REQUEST interceptor, leading-key ABAC in the tool | `tests/test_interceptor.py`, `tests/test_gateway_client.py`; cases 12, 21 to 23, 25, 48 and 49 |
 | 4 | Runtime to workspace | Tenant prefix plus per-session storage, VPC-bound 15-minute credentials, session-to-tenant check, runtime resource policy | `tests/test_runtime.py`; cases 13 to 20, 28 to 31 and 44 to 47 |
 | 5 | 10k+ tenants (partial) | Isolation primitives are constant per tenant, but the model request rate binds first: at Nova Lite's default in-Region quota the sample serves about 66 turns a minute per account and Region | [Scale and quotas](#scale-and-quotas) |
@@ -63,14 +66,28 @@ Still not observed live: the same credentials being refused outside the runtime'
   app client, so a user cannot move themselves into another tenant. A `customerId` in the body
   that disagrees with the token is rejected with 403 rather than ignored, so attempts are visible.
 - **System events** (webhooks, schedulers) call `POST /events` with SigV4. Only full role ARNs on
-  the `eventProducerRoleArns` allowlist (account included) may assert a tenant, and the event text
-  reaches the model as data, not instructions. By default an event turn cannot create quotes or run
-  scripts; `-c eventTurnTools=all` opts in.
+  the `eventProducerRoleArns` allowlist (account included, empty by default) may assert a tenant,
+  and the event text reaches the model as data, not instructions. By default an event turn cannot
+  itself create quotes or run scripts; `-c eventTurnTools=all` opts in. This gate is per turn only:
+  the event text is stored in the tenant's single conversation (one `SnapshotSessionManager` on the
+  tenant's storage ID), so the tenant's next user turn reads it back with `create_quote` and
+  `execute_process` available. Acting on it then needs an allowlisted producer to have posted the
+  event and a model that follows the stored text instead of treating it as data; either way the
+  effect stays inside that one tenant, as in-tenant injection does in general (see the prompt
+  injection row under [Threat model](#threat-model)).
 - `GET /turns/{requestId}` reads only the caller's own partition and returns the same 404 for
   "not yours" and "does not exist", so it is not an existence oracle across tenants.
+- A tenant is one business, not one employee, and users of the same tenant are not separated from
+  each other: they share one conversation, and any of them can read the tenant's requests by
+  `requestId`. Separating users inside a tenant needs a user key (for example the ID token's `sub`)
+  on the request records and the conversation.
 - The FIFO queue policy denies `sqs:SendMessage` to every principal except the ingress role and
   requires TLS. The message group is the tenant hash, so a tenant's turns stay ordered while
-  other tenants run in parallel.
+  other tenants run in parallel. Neither queue's policy limits receiving, and the dead-letter queue
+  has no resource policy, so a principal with account-level SQS permissions, an administrator among
+  them, can read or delete queued turns directly, message text included (the dead-letter queue keeps
+  it for up to 14 days). Add Deny statements to the queue policies if that direct path must be
+  closed as well.
 - The deduplication ID is a hash of tenant and request ID. With a bare `requestId`, tenant A
   reusing tenant B's idempotency key inside the five-minute window would silently drop B's turn
   if deduplication were ever queue-scoped. The queue also uses message-group deduplication scope.
@@ -87,14 +104,33 @@ The worker's role has no S3 permissions at all. At the start of each turn it ass
   and `transfer/${aws:PrincipalTag/TenantId}/*`; read-only on the tenant's `uploads/`;
 - `s3:ListBucket` only with `s3:prefix` under those paths;
 - `kms:Decrypt` and `kms:GenerateDataKey` only via S3 and only when
-  `kms:EncryptionContext:aws:s3:arn` is one of the tenant's object ARNs. S3 Bucket Keys are off
-  so the object ARN reaches KMS. This is a second lock that does not depend on the S3 policy
-  being right.
+  `kms:EncryptionContext:aws:s3:arn` is one of the tenant's object ARNs (on its own, this IAM grant
+  restricts nothing: see the next paragraph).
 
-The bucket policy adds a backstop: `GetObject` and `PutObject` under `tenants/` and `transfer/`
-are denied to every principal except the tenant roles (plus any break-glass roles you pass with
-`-c adminRoleArns=...`). A broad `s3:*` grant added to some other role later does not open
-tenant data. Admins can still change the bucket policy, and that change is logged.
+The S3 prefix scoping above is the first lock. The data key's own policy is the second. A key policy
+that names a role grants that role the key whatever its IAM policies say, so the key policy itself
+holds both tenant roles to their tenant: they may use the key only through S3, and only when the
+encryption context `aws:s3:arn` names an object under the session's own `tenants/<sid>/` or
+`transfer/<sid>/` prefix. For objects encrypted with the data key, the bucket's default, this lock
+holds even if an S3 policy is wrong; a write that names another encryption type or key is outside
+it. S3 sends the object ARN as the context because S3 Bucket Keys are off; with Bucket Keys on it
+would send the bucket ARN, which the condition refuses. What the condition checks, exactly: the
+bucket part of the ARN is a wildcard, because the key policy cannot name the bucket whose encryption
+names the key; the object must sit under the session's `tenants/<sid>/` or `transfer/<sid>/`; and
+that prefix may not appear below another `tenants/` or `transfer/` path. So a key in another
+tenant's prefix that contains `tenants/<sid>/` further down does not match. The same guard refuses a
+tenant's own key that contains `tenants/<sid>/` or `transfer/<sid>/` anywhere below its prefix; the
+workspace sync leaves such a file out and reports it as not saved. Every object the key encrypts sits
+under `tenants/` or `transfer/`, because no principal the key policy admits can write elsewhere.
+
+The bucket policy adds a backstop: every object action under `tenants/` and `transfer/`, and every
+listing, is denied to every principal except the tenant roles (plus any break-glass roles you pass
+with `-c adminRoleArns=...`). A broad `s3:*` grant added to some other role later does not open
+tenant data. Admins can still change the bucket policy through a stack deployment, which CloudTrail
+records. Two deployment options add exemptions: `-c sandbox=true` exempts the stack's auto-delete
+function, which empties the bucket when the stack is deleted, and `-c demo=true` (which requires
+`-c sandbox=true`) exempts the demo operator role for the two demo tenants' prefixes only (see
+[Threat model](#threat-model)).
 
 The DynamoDB tables (coordination and SaaS data) have no such resource-policy backstop: the
 `TENANT#` leading-key scoping constrains only the tenant roles' sessions, so a principal with
@@ -176,8 +212,10 @@ Logs endpoint policy allows only this account's principals writing this account'
 without it, code in the runtime could ship data out with its own credentials through the
 endpoint. Route 53 Resolver DNS Firewall resolves only this Region's S3 and CloudWatch Logs names
 and blocks everything else. A blocked lookup raises the `DnsBlockedLookups` alarm, and the Resolver
-query logs (`DnsQueryLogs`) name it. `-c dnsFirewallMode=ALERT` resolves every name and only logs,
-for finding a missing name.
+query logs (`DnsQueryLogs`) name it. The stack's two alarms (`DnsBlockedLookups` and `TurnBacklog`)
+have no actions, so they notify nobody until you subscribe them to a notification target, for
+example an SNS topic. `-c dnsFirewallMode=ALERT` resolves every name and only logs, for finding a
+missing name.
 
 ## Threat model
 
@@ -196,7 +234,27 @@ inside that tenant. That needs confirmation steps for irreversible tools, Bedroc
 model invocation logging, which are outside this boundary.
 
 Trusted: the shared harness code. It can mint credentials for any tenant by design, so it is
-reviewed code with a small surface, and its role has no data access of its own.
+reviewed code with a small surface, and its role's one data store is the coordination table
+(request status, reply text and tool names). For the same reason, anyone allowed `iam:PassRole` on
+`GatewayRole`, `WorkerRole`, `ToolsFunctionRole` or `IngressRole` can reach every tenant.
+`GatewayRole` trusts any AgentCore Gateway in the account and is the only caller the tools function
+admits, so with `bedrock-agentcore:CreateGateway` it can put a Gateway without the interceptor in
+front of the tools and pass any `tenantId`. `WorkerRole` and `ToolsFunctionRole` can run code of the
+holder's choosing as the role. `IngressRole` can record and queue a turn for any tenant and read its
+reply, and `DeadLetterRole` can read and change any tenant's coordination records. Grant
+`iam:PassRole` on the stack's roles to the deployment only.
+
+Demo mode: `-c demo=true` adds the demo operator role, which any principal in the account that is
+allowed to assume it can use. Its S3, KMS, SaaS-table and coordination-item grants and its bucket
+policy exemption name the two demo tenants only. It can still create, sign in as and change the
+password of any user in the user pool, and so act as any tenant through the API; scan the
+coordination table, which returns every tenant's turn states, tool names and times (IAM limits the
+scan to those attributes, so not reply text or errors); and read the worker's logs, which hold error
+details from every tenant's turns. Cognito has no condition key for a user's attributes, a table
+scan cannot be held to partitions and every tenant's turns log to the same log group, so these three
+cannot be narrowed further. Deploy with `-c demo=true -c sandbox=true` only in a sandbox account
+that holds demo data; synth refuses `-c demo=true` without `-c sandbox=true`, since demo mode implies
+sandbox mode (tenant data, its key and the user pool are deleted with the stack).
 
 No long-lived secrets: the model is reached through IAM roles, so there are no inference API keys,
 and the tenant-context signing key is a KMS HMAC key that never leaves KMS. Every function's
@@ -213,6 +271,9 @@ The runtime package has no `certifi`, so botocore's own bundle is the one it use
 | `tenants/{sid}/workspace/` | Durable execution workspace | `TenantRuntimeRole` for `{sid}`, runtime VPC only |
 | `tenants/{sid}/uploads/` | Validated user uploads | Read: harness and runtime roles for `{sid}` |
 | `transfer/{sid}/{requestId}/` | Large scripts and results; expires after one day | `TenantHarnessRole` for `{sid}`; presigned URLs for the runtime |
+
+Break-glass roles can also read every prefix, and with `-c demo=true` the demo operator role can
+read and write the two demo tenants' `tenants/{sid}/` prefixes.
 
 `{sid}` is the first 32 hex characters of a namespaced SHA-256 of the customer ID: stable, not
 secret, and spread across S3 partitions.
@@ -268,8 +329,10 @@ a month at 10,000 tenants. The snapshot write count comes from the worker test:
 one read plus three writes for a turn with no tools, and two more writes per tool call.
 
 Turning on S3 Bucket Keys removes most of the SSE-KMS requests (about $0.06 per tenant-month in
-total) but drops the per-object encryption-context check, the second lock in Requirement 2. The
-IAM prefix scoping still holds.
+total), but S3 then sends the bucket ARN instead of the object ARN as encryption context for every
+object written after the change. The data key's per-object check, the second lock in Requirement 2,
+would refuse those reads and writes, so it has to be removed first, and the IAM prefix scoping is
+left as the only lock.
 
 Fixed costs that do not grow with tenants: the Logs interface endpoint in two Availability Zones
 (2 x $0.013 per hour, about $19 a month), two customer managed KMS keys ($1 per key version per
@@ -338,16 +401,21 @@ output: [evidence/live-demo.md](evidence/live-demo.md).
 | IAM evaluation of the deployed tenant roles as tenant B | 2, 6 | Own S3 prefix and DynamoDB partition allowed; tenant A's denied |
 | Tenant B tells the agent to act for tenant A | 3, 6 | Only `list_jobs` ran, returning B's jobs; none of A's job IDs or addresses |
 | DNS Firewall for the runtime VPC | 4 | Catch-all rule BLOCK, one ALLOW rule, rule group associated with the runtime VPC |
+| The demo operator role outside the demo tenants | 2, 7 | Denied: another tenant's S3 objects and listing, the transfer area, whole-bucket and multipart-upload listings, another tenant's SaaS and coordination items, and a coordination scan that asks for reply text. Its own demo steps were allowed |
+| The data key's context check | 2 | Both tenants' turns read and wrote their own objects (snapshots, uploads, a workspace file); a write inside demo tenant B's prefix with a key naming tenant A further down was refused by KMS; the IAM policy simulator, given the deployed key policy, denied a tenant B session tenant A's objects |
+| `POST /events` from a signed caller not on the allowlist | 1 | 403 `caller is not an allowed event producer` |
 
-The rows for the two Gateway checks, the direct runtime invoke and the DNS Firewall show the 11
-November 2026 run, in which all ten checks passed; the other rows show the 19 October run. The demo
-signs its Gateway calls as the operator role, which the Gateway resource policy refuses before the
-interceptor runs, so the interceptor's own refusals (`missing tenant context`, and `tenant context
-is not authentic` from the KMS MAC check) are covered by the unit tests in `tests/test_interceptor.py`,
-`tests/test_tenant_token.py` and `tests/test_demo_checks.py`, not by the live run.
+The rows for the two Gateway checks, the direct runtime invoke and the DNS Firewall show the 20
+November 2026 run, in which all ten checks passed, as do the last three rows; the other rows show
+the 19 October run. The demo signs its Gateway calls as the operator role, which the Gateway
+resource policy refuses before the interceptor runs, so the interceptor's own refusals (`missing
+tenant context`, and `tenant context is not authentic` from the KMS MAC check) are covered by the
+unit tests in `tests/test_interceptor.py`, `tests/test_tenant_token.py` and
+`tests/test_demo_checks.py`, not by the live run.
 
 Before any tenant data was loaded, anonymous calls were refused: `POST /turns` and `GET /turns`
-401, unsigned `POST /events` 403, unsigned Gateway `tools/list` 401.
+401, unsigned `POST /events` 403, unsigned Gateway `tools/list` 401. The same calls were refused the
+same way after the 20 November 2026 deploy.
 
 The four behaviours the summary listed as deployment-only:
 
@@ -389,8 +457,9 @@ rules, and the only way in is `InvokeAgentRuntime`, which IAM and the resource p
 - **DNS Firewall blocks by default.** A runtime dependency that needs another name fails until the
   name is added to the allowlist; a deploy with `-c dnsFirewallMode=ALERT` shows which name.
 - **Break-glass.** Without `-c adminRoleArns=...` even account admins are denied tenant objects,
-  tenant sessions and direct Gateway calls until they change the policies (which CloudTrail
-  records). Decide who holds break-glass.
+  tenant sessions and direct Gateway calls until they change the stack's policies, function code or
+  configuration (all recorded by CloudTrail). With `-c demo=true` that no longer holds for the demo
+  operator role: see Demo mode under [Threat model](#threat-model). Decide who holds break-glass.
 - **Replay safety** covers `create_quote`, the demo's one mutating tool: an operation key from
   `requestId` and `toolUseId`, with the outcome kept in an execution ledger. Other mutating tools
   need the same, and scripts with external side effects need their own contract.

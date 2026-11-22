@@ -61,6 +61,11 @@ class Stub:
 
     def scan(self, **kwargs):
         assert "resultText" not in kwargs["ProjectionExpression"] and "message" not in kwargs["ProjectionExpression"]
+        # Only what the demo operator role may scan (MeasureCountTurns in infra/stack.py).
+        assert kwargs["Select"] == "SPECIFIC_ATTRIBUTES"
+        names = kwargs["ExpressionAttributeNames"]
+        projected = {names.get(n.strip(), n.strip()) for n in kwargs["ProjectionExpression"].split(",")}
+        assert projected <= set(measured.TURN_SCAN_ATTRIBUTES) and {"pk", "sk"} <= set(measured.TURN_SCAN_ATTRIBUTES)
         items = [
             {"state": {"S": "COMPLETED"}, "toolTrace": {"L": [{"S": "saas___list_jobs"}]}},
             {"state": {"S": "COMPLETED"}, "toolTrace": {"L": [{"S": "execute_process"}]}},
