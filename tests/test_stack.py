@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 import json
+from pathlib import Path
 
 import aws_cdk as cdk
 import pytest
@@ -52,12 +53,17 @@ def actions(statement):
     return [value] if isinstance(value, str) else value
 
 
-def test_shared_worker_role_holds_no_tenant_data_access(template):
+def test_shared_worker_role_has_no_s3_or_gateway_access(template):
     granted = [a for s in statements_for(template, "WorkerRole") for a in actions(s)]
     assert granted, "expected worker statements"
     assert not [a for a in granted if a.startswith("s3:")]
     assert "bedrock-agentcore:InvokeGateway" not in granted
     assert not [a for a in granted if a == "bedrock:*" or a == "*"]
+    # Its one data store is the coordination table (request status and reply text), as the docs say.
+    [coordination] = [k for k in resources(template, "AWS::DynamoDB::GlobalTable") if k.startswith("Coordination")]
+    for statement in statements_for(template, "WorkerRole"):
+        if any(a.startswith("dynamodb:") for a in actions(statement)):
+            assert statement["Resource"] == {"Fn::GetAtt": [coordination, "Arn"]}
 
 
 def test_model_access_is_pinned_not_wildcarded(template):
@@ -270,7 +276,7 @@ def test_the_password_policy_sets_every_field(template):
 
 
 def test_demo_adds_an_admin_password_client_wired_into_the_authorizer(tmp_path):
-    template = synth(tmp_path, demo="true")
+    template = synth(tmp_path, demo="true", sandbox="true")
     flows = [set(c["Properties"]["ExplicitAuthFlows"]) for c in resources(template, "AWS::Cognito::UserPoolClient").values()]
     assert len(flows) == 2
     admin = [f for f in flows if "ALLOW_ADMIN_USER_PASSWORD_AUTH" in f]
@@ -450,6 +456,53 @@ def test_break_glass_can_read_tenant_data_through_the_key(tmp_path):
     assert glass["Action"] == ["kms:Decrypt", "kms:DescribeKey"] and BREAK_GLASS in json.dumps(glass["Principal"])
 
 
+S3_CONTEXT = "kms:EncryptionContext:aws:s3:arn"
+
+
+def key_condition_allows(statement, object_arn, tenant):
+    """An offline model of the key policy's S3 context check for one tenant session.
+
+    IAM's StringLike '*' matches any run of characters, '/' included, as fnmatchcase does here
+    (the patterns hold no '[' or '?'). This models IAM's matching; it does not run IAM itself."""
+    from fnmatch import fnmatchcase
+    condition = statement["Condition"]
+    like = [p.replace(TENANT_VAR, tenant) for p in condition["StringLike"][S3_CONTEXT]]
+    not_like = [p.replace(TENANT_VAR, tenant) for p in condition["StringNotLike"][S3_CONTEXT]]
+    return any(fnmatchcase(object_arn, p) for p in like) and not any(fnmatchcase(object_arn, p) for p in not_like)
+
+
+def test_the_data_key_holds_each_tenant_role_to_its_own_prefixes(template, tenants):
+    stmts = key_policy(template, "TenantDataKey")
+    use = stmts["TenantRolesUseThroughS3"]
+    assert use["Condition"]["StringLike"][S3_CONTEXT] == [
+        f"arn:aws:s3:::*/tenants/{TENANT_VAR}/*", f"arn:aws:s3:::*/transfer/{TENANT_VAR}/*"]
+    assert use["Condition"]["StringNotLike"][S3_CONTEXT] == [
+        f"arn:aws:s3:::*/{area}*/{p}*" for area in ("tenants/", "transfer/")
+        for p in (f"tenants/{TENANT_VAR}/", f"transfer/{TENANT_VAR}/")]
+    assert "kms:DescribeKey" not in use["Action"]  # it carries no encryption context, so it could never match
+    # The key policy cannot name the bucket (the bucket's encryption names the key), hence the wildcard.
+    [bucket] = resources(template, "AWS::S3::Bucket")
+    assert bucket not in json.dumps(stmts)
+    a, b = tenants["anycompany-plumbing"], tenants["example-corp-electrical"]
+    objects = "arn:aws:s3:::any-tenant-bucket"
+    for own in (f"tenants/{a}/harness/session.json", f"tenants/{a}/workspace/out/total.txt",
+                f"tenants/{a}/uploads/prices.csv", f"transfer/{a}/req-00000001/script.py"):
+        assert key_condition_allows(use, f"{objects}/{own}", a), own
+    for other in (f"tenants/{b}/harness/session.json", f"transfer/{b}/req-00000001/script.py",
+                  f"tenants/{b}/workspace/tenants/{a}/x",  # another tenant's key naming A further down
+                  f"transfer/{b}/req-00000001/transfer/{a}/x", f"tenants/{b}/uploads/transfer/{a}/x",
+                  f"tenants/{a}/workspace/tenants/{a}/x"):  # the documented cost: a repeated own prefix
+        assert not key_condition_allows(use, f"{objects}/{other}", a), other
+    # With S3 Bucket Keys on, S3 would send the bucket ARN: refused, so turning them on needs a policy change.
+    assert not key_condition_allows(use, objects, a)
+
+
+def test_a_key_condition_needs_prefixes_that_end_in_a_slash():
+    for prefixes in ([], ["tenants/x"]):
+        with pytest.raises(ValueError, match="ending in '/'"):
+            policies.s3_object_context(region="ap-southeast-2", key_prefixes=prefixes)
+
+
 def test_the_gateway_declares_the_protocol_version_the_client_sends(template):
     from worker import gateway_client
     [gw] = resources(template, "AWS::BedrockAgentCore::Gateway").values()
@@ -494,10 +547,10 @@ def test_no_break_glass_and_no_demo_operator_by_default(template):
 
 
 def test_the_demo_operator_role_is_scoped_and_not_break_glass(tmp_path):
-    template = synth(tmp_path, demo="true")
+    template = synth(tmp_path, demo="true", sandbox="true")
     [role_key] = [k for k in resources(template, "AWS::IAM::Role") if k.startswith("DemoOperatorRole")]
     granted = [a for s in statements_for_role_key(template, role_key) for a in actions(s)]
-    # It can set up the demo and read the bucket, and may attempt the AgentCore calls for the refusal check.
+    # It can set up the demo and read the demo tenants' objects, and may attempt the AgentCore calls for the refusal check.
     assert "bedrock-agentcore:InvokeAgentRuntime" in granted and "iam:SimulatePrincipalPolicy" in granted
     # The Gateway checks pass only on the Gateway's 403: with this grant, its resource policy is the only deny.
     assert "bedrock-agentcore:InvokeGateway" in granted
@@ -520,8 +573,66 @@ def statements_for_role_key(template, role_key):
     return out
 
 
+def test_the_demo_operator_reaches_only_the_demo_tenants_data(tmp_path, tenants):
+    template = synth(tmp_path, demo="true", sandbox="true")
+    [role_key] = [k for k in resources(template, "AWS::IAM::Role") if k.startswith("DemoOperatorRole")]
+    by_sid = {s.get("Sid"): s for s in statements_for_role_key(template, role_key)}
+    sids = [tenants["anycompany-plumbing"], tenants["example-corp-electrical"]]
+    [bucket_id] = resources(template, "AWS::S3::Bucket")
+    bucket = {"Fn::GetAtt": [bucket_id, "Arn"]}
+    demo_objects = [{"Fn::Join": ["", [bucket, f"/tenants/{sid}/*"]]} for sid in sids]
+    # S3: the two demo tenants' objects and listings, nothing else in the bucket.
+    s3 = {sid for sid, s in by_sid.items() if any(a.startswith("s3:") for a in actions(s))}
+    assert s3 == {"SeedAndInspectDemoTenantObjects", "ListDemoTenantPrefixes"}
+    assert by_sid["SeedAndInspectDemoTenantObjects"]["Resource"] == demo_objects
+    listing = by_sid["ListDemoTenantPrefixes"]
+    assert listing["Action"] == "s3:ListBucket" and listing["Resource"] == bucket
+    assert listing["Condition"] == {"StringLike": {"s3:prefix": [f"tenants/{sid}/*" for sid in sids]}}
+    # SaaS items: the demo tenants' partitions only; DescribeTable names no partition.
+    seed = by_sid["SeedDemoSaasData"]
+    assert seed["Condition"] == {"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [f"TENANT#{sid}" for sid in sids]},
+                                 "Null": {"dynamodb:LeadingKeys": "false"}}
+    assert by_sid["DescribeSaasTable"]["Action"] == "dynamodb:DescribeTable"
+    # Coordination table: the replay check's GetItem in the demo partitions; the Cost tab's scan reaches
+    # every tenant's records but only the attributes it counts, never reply text or errors.
+    replay = by_sid["ReadCoordinationForReplayCheck"]
+    assert replay["Action"] == "dynamodb:GetItem" and replay["Condition"] == seed["Condition"]
+    assert by_sid["MeasureCountTurns"]["Condition"] == {
+        "ForAllValues:StringEquals": {"dynamodb:Attributes": ["pk", "sk", "state", "toolTrace", "updatedAt"]},
+        "StringEquals": {"dynamodb:Select": "SPECIFIC_ATTRIBUTES"}, "Null": {"dynamodb:Attributes": "false"}}
+    # Cognito: only what the demo calls (create, set the password, sign in), on the whole pool.
+    assert sorted(by_sid["SeedAndAuthenticateDemoUsers"]["Action"]) == [
+        "cognito-idp:AdminCreateUser", "cognito-idp:AdminInitiateAuth", "cognito-idp:AdminSetUserPassword"]
+    # The bucket backstop admits it for those prefixes only.
+    backstop = bucket_statements(template)
+    objects_deny = backstop["DemoOperatorOnlyDemoTenantObjects"]
+    operator = {"ArnEquals": {"aws:PrincipalArn": [{"Fn::GetAtt": [role_key, "Arn"]}]}}
+    assert objects_deny["Effect"] == "Deny" and objects_deny["Action"] == "s3:*"
+    assert objects_deny["NotResource"] == [bucket, *demo_objects] and objects_deny["Condition"] == operator
+    list_deny = backstop["DemoOperatorListsOnlyDemoTenants"]
+    assert list_deny["Effect"] == "Deny" and list_deny["Resource"] == bucket
+    assert list_deny["Action"] == ["s3:ListBucket", "s3:ListBucketVersions"]  # the listings s3:prefix applies to
+    assert list_deny["Condition"] == {**operator, "StringNotLike": {"s3:prefix": [f"tenants/{sid}/*" for sid in sids]}}
+    uploads_deny = backstop["DemoOperatorListsNoUploads"]
+    assert uploads_deny["Action"] == "s3:ListBucketMultipartUploads" and uploads_deny["Condition"] == operator
+    # The data key: through S3, for the demo tenants' objects only, with the same guard as the tenant roles.
+    seeds = key_policy(template, "TenantDataKey")["DemoOperatorSeedsThroughS3"]
+    assert seeds["Action"] == ["kms:Decrypt", "kms:GenerateDataKey*"]
+    assert seeds["Condition"] == policies.s3_object_context(
+        region="ap-southeast-2", key_prefixes=[f"tenants/{sid}/" for sid in sids])
+    stray = "arn:aws:s3:::any-tenant-bucket/tenants/{}/workspace/tenants/{}/x".format(sids[1], sids[0])
+    assert not key_condition_allows(seeds, stray, "")
+
+
+def test_a_demo_operator_without_demo_prefixes_is_refused():
+    with pytest.raises(ValueError, match="demo tenants' prefixes"):
+        policies.bucket_guardrail_statements(
+            bucket_arn="arn:aws:s3:::b", tenant_role_arns=["arn:aws:iam::111111111111:role/T"], deployer_role_arns=[],
+            demo_operator_role_arns=["arn:aws:iam::111111111111:role/D"])
+
+
 def test_the_demo_operator_reads_usage_for_the_cost_tab_from_this_stack_only(tmp_path):
-    template = synth(tmp_path, demo="true")
+    template = synth(tmp_path, demo="true", sandbox="true")
     [role_key] = [k for k in resources(template, "AWS::IAM::Role") if k.startswith("DemoOperatorRole")]
     statements = statements_for_role_key(template, role_key)
     by_sid = {s.get("Sid"): s for s in statements}
@@ -566,3 +677,45 @@ def test_worker_concurrency_follows_the_model_request_quota(tmp_path):
     # An explicit worker cap wins over the derived value.
     override = synth(tmp_path / "c", workerMaxConcurrency="40")
     assert function_props(override, "WorkerFunction")["ReservedConcurrentExecutions"] == 40
+
+
+def test_demo_mode_requires_sandbox_mode(tmp_path):
+    # Demo mode grants the demo operator pool-wide Cognito admin, so it can act as any tenant through
+    # the API; synth refuses it unless sandbox mode is on too. Any value the stack reads as demo
+    # (case-insensitive "true") counts, parsed exactly as the stack parses the flag.
+    with pytest.raises(ValueError, match="sandbox"):
+        synth(tmp_path / "demo-only", demo="true")
+    with pytest.raises(ValueError, match="sandbox"):
+        synth(tmp_path / "demo-upper", demo="TRUE")
+    # Demo with sandbox synthesizes; so does the default; and a value that does not turn demo on
+    # ("1") is not demo mode, so it needs no sandbox.
+    assert synth(tmp_path / "demo-sandbox", demo="true", sandbox="true")["Resources"]
+    assert synth(tmp_path / "default")["Resources"]
+    assert synth(tmp_path / "demo-not-on", demo="1")["Resources"]
+
+
+def test_a_placeholder_only_asset_dir_is_refused_outside_tests(tmp_path, monkeypatch):
+    # Replay the real sequence: a test run (which sets SPLIT_HARNESS_ALLOW_PLACEHOLDER_ASSETS=1 in
+    # conftest) leaves a placeholder-only directory under .build/, and a later real synth or deploy
+    # that skips scripts/build_assets.sh must refuse it rather than ship a non-working layer and
+    # runtime. BUILD is pointed at a temporary directory so the repo's real .build/ is untouched.
+    import infra.stack as stack
+
+    monkeypatch.setattr(stack, "BUILD", tmp_path / "build")
+    rel = "layers/agent/python"
+    monkeypatch.setenv("SPLIT_HARNESS_ALLOW_PLACEHOLDER_ASSETS", "1")
+    created = Path(stack.asset_dir(rel))
+    assert (created / "PLACEHOLDER").is_file()  # test mode leaves the placeholder behind
+
+    monkeypatch.delenv("SPLIT_HARNESS_ALLOW_PLACEHOLDER_ASSETS", raising=False)
+    with pytest.raises(RuntimeError, match="build_assets.sh"):
+        stack.asset_dir(rel)
+
+    # An empty directory (a build_assets.sh run that stopped before populating it) is refused too,
+    # and a populated, markerless directory is accepted.
+    empty = tmp_path / "build" / "runtime"
+    empty.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="build_assets.sh"):
+        stack.asset_dir("runtime")
+    (empty / "main.py").write_text("x\n")
+    assert stack.asset_dir("runtime") == str(empty)

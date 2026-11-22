@@ -20,7 +20,8 @@ REQUIREMENTS = [
         "number": 2,
         "title": "Secure connectivity from harness Lambda to S3 session state",
         "how": "Each turn uses a TenantHarnessRole session tagged with the tenant. IAM limits it to that "
-               "tenant's prefix and KMS encryption context; the worker role itself has no data access.",
+               "tenant's prefix, and the data key's policy to that tenant's objects; the worker role's one "
+               "data store is the coordination table of request status and replies.",
         "checks": ["abac"],
     },
     {

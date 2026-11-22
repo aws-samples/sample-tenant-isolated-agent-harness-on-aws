@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any
@@ -39,6 +40,12 @@ REQUEST_TTL_SECONDS = 7 * 24 * 3600
 MAX_OPEN_REQUESTS = int(os.environ.get("MAX_OPEN_REQUESTS", "20"))
 SLOT_TTL_SECONDS = 6 * 3600
 TENANT_CLAIM = "custom:tenant_id"
+# The only caller shape /events accepts: an STS assumed-role session,
+# arn:<partition>:sts::<account>:assumed-role/<RoleName>/<session>, with IAM's role-name and STS's
+# session-name characters. Anything else (IAM users, whose paths may contain ':' and '/', federated
+# users, the root user) is refused instead of being searched for a role name.
+_ASSUMED_ROLE_ARN = re.compile(r"arn:(?P<partition>aws(?:-[a-z]+)*):sts::(?P<account>[0-9]{12}):"
+                               r"assumed-role/(?P<role>[A-Za-z0-9+=,.@_-]{1,64})/[A-Za-z0-9+=,.@_-]{1,64}")
 
 _clients: dict[str, Any] = {}
 
@@ -103,11 +110,11 @@ def _canonical_role_arn(arn: str) -> str | None:
 
 
 def _principal_role_arn(caller: str) -> str | None:
-    # arn:<partition>:sts::<account>:assumed-role/<RoleName>/<session>
-    parts = caller.split(":")
-    if len(parts) < 6 or ":assumed-role/" not in caller or not parts[4].isdigit():
+    """The role ARN behind an assumed-role session ARN, or None for any other caller."""
+    match = _ASSUMED_ROLE_ARN.fullmatch(caller) if isinstance(caller, str) else None
+    if match is None:
         return None
-    return f"arn:{parts[1]}:iam::{parts[4]}:role/{caller.split(':assumed-role/')[1].split('/')[0]}"
+    return f"arn:{match['partition']}:iam::{match['account']}:role/{match['role']}"
 
 
 def _allowed_producer(event: dict) -> str:

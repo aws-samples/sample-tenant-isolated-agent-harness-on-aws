@@ -142,6 +142,64 @@ def test_system_events_need_an_allowlisted_producer(ingress):
     assert module.handler(event("arn:aws:sts::111111111111:assumed-role/Billing/x", "evt-00000002"))["statusCode"] == 202
 
 
+PRODUCER = "JobWebhookProducer"
+
+
+@pytest.mark.parametrize("caller", [
+    # IAM user paths may contain ':' and '/', so a user can carry the producer's assumed-role text.
+    f"arn:aws:iam::111111111111:user/:assumed-role/{PRODUCER}/evil",
+    f"arn:aws:iam::111111111111:user/x/assumed-role/{PRODUCER}/evil",
+    f"arn:aws:iam::111111111111:user/{PRODUCER}",
+    f"arn:aws:sts::111111111111:federated-user/{PRODUCER}",
+    "arn:aws:iam::111111111111:root",
+    f"arn:aws:iam::111111111111:role/{PRODUCER}",                      # a role ARN, not a session
+    f"arn:aws:iam::111111111111:assumed-role/{PRODUCER}/x",             # wrong service
+    f"arn:aws:sts:ap-southeast-2:111111111111:assumed-role/{PRODUCER}/x",  # Region set
+    f"arn:aws:sts::11111111111:assumed-role/{PRODUCER}/x",              # 11-digit account
+    f"arn:aws:sts::1111111111111:assumed-role/{PRODUCER}/x",            # 13-digit account
+    f"arn:aws:sts::{chr(0x661) * 12}:assumed-role/{PRODUCER}/x",        # non-ASCII (Arabic-Indic) digits
+    f"arn:aws-cn:sts::111111111111:assumed-role/{PRODUCER}/x",          # other partition
+    f"arn:aws:sts::111111111111:assumed-role/{PRODUCER}",               # no session
+    f"arn:aws:sts::111111111111:assumed-role/{PRODUCER}/",              # empty session
+    f"arn:aws:sts::111111111111:assumed-role/{PRODUCER}/x/y",           # extra segment
+    f"arn:aws:sts::111111111111:assumed-role/{PRODUCER}/x:y",           # ':' in the session
+    f"arn:aws:sts::111111111111:assumed-role/{PRODUCER}/x\n",           # trailing newline
+    f" arn:aws:sts::111111111111:assumed-role/{PRODUCER}/x",            # leading space
+    f"ARN:aws:sts::111111111111:assumed-role/{PRODUCER}/x",
+    f"arn:aws:sts::111111111111:assumed-role/{PRODUCER}x/x",            # longer role name
+    "arn:aws:sts::111111111111:assumed-role//x",
+    "arn:aws:sts::111111111111:assumed-role/" + "R" * 65 + "/x",        # longer than IAM allows
+    "", "arn", "not an arn",
+])
+def test_only_an_assumed_role_session_of_an_allowlisted_role_passes(ingress, caller):
+    module, sqs, url, _ = ingress
+    event = {"routeKey": "POST /events",
+             "body": json.dumps({"customerId": "example-corp-electrical", "message": "job created",
+                                 "requestId": "evt-00000003"}),
+             "requestContext": {"authorizer": {"iam": {"userArn": caller}}}}
+    assert module.handler(event)["statusCode"] == 403
+    assert _messages(sqs, url) == []
+
+
+def test_role_and_session_names_may_use_every_character_iam_allows(ingress, monkeypatch):
+    module, sqs, url, _ = ingress
+    # The allowlist is comma-separated, so a role name with a comma cannot be listed (it fails closed).
+    name = "svc+=.@_-Producer"
+    monkeypatch.setenv("EVENT_PRODUCER_ROLE_ARNS", f"arn:aws:iam::111111111111:role/team/{name}")
+    event = {"routeKey": "POST /events",
+             "body": json.dumps({"customerId": "anycompany-plumbing", "message": "job created",
+                                 "requestId": "evt-00000004"}),
+             "requestContext": {"authorizer": {"iam": {
+                 "userArn": f"arn:aws:sts::111111111111:assumed-role/{name}/s+=,.@_-1"}}}}
+    assert module.handler(event)["statusCode"] == 202
+    assert json.loads(_messages(sqs, url)[0]["Body"])["source"] == f"event:{name}"
+    assert module._principal_role_arn("arn:aws:sts::111111111111:assumed-role/a+=,.@_-b/s") == \
+        "arn:aws:iam::111111111111:role/a+=,.@_-b"
+    # Other partitions keep their own allowlist entries.
+    assert module._principal_role_arn("arn:aws-us-gov:sts::111111111111:assumed-role/P/s") == \
+        "arn:aws-us-gov:iam::111111111111:role/P"
+
+
 def test_a_tenant_cannot_have_more_than_its_limit_of_requests_in_flight(ingress, monkeypatch):
     module, sqs, url, ddb = ingress
     monkeypatch.setattr(module, "MAX_OPEN_REQUESTS", 2)

@@ -53,8 +53,16 @@ class WorkspaceSync:
         self._s3, self._bucket, self._prefix = s3, bucket, prefix
         self._dir, self._max_files, self._max_bytes = local_dir, max_files, max_bytes
         self._manifest_path = state_dir / "workspace-manifest.json"
+        # The data key's policy refuses an object whose key names this tenant's own prefix again
+        # further down (infra/policies.py, s3_object_context), so such a path is neither saved nor
+        # fetched. Failing the sync instead would fail every later task of this session.
+        sid = prefix.split("/")[1] if prefix.startswith("tenants/") else ""
+        self._refused_markers = (f"/tenants/{sid}/", f"/transfer/{sid}/") if sid else ()
         local_dir.mkdir(parents=True, exist_ok=True)
         state_dir.mkdir(parents=True, exist_ok=True)
+
+    def _key_policy_refuses(self, rel: str) -> bool:
+        return any(marker in f"/{rel}" for marker in self._refused_markers)
 
     def _load(self) -> dict:
         try:
@@ -74,7 +82,7 @@ class WorkspaceSync:
         for page in paginator.paginate(Bucket=self._bucket, Prefix=self._prefix):
             for obj in page.get("Contents", []):
                 rel = obj["Key"][len(self._prefix):]
-                if not rel or rel.endswith("/"):
+                if not rel or rel.endswith("/") or self._key_policy_refuses(rel):
                     continue
                 remote[safe_relative(rel)] = {"etag": obj["ETag"].strip('"'), "size": obj["Size"]}
                 total += obj["Size"]
@@ -109,6 +117,7 @@ class WorkspaceSync:
     def push(self) -> dict:
         manifest = self._load()
         seen: set[str] = set()
+        not_saved: list[str] = []
         uploaded = total = 0
         for dirpath, dirnames, filenames in os.walk(self._dir, followlinks=False):
             dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
@@ -122,6 +131,9 @@ class WorkspaceSync:
                 total += stat.st_size
                 if len(seen) > self._max_files or total > self._max_bytes:
                     raise WorkspaceError("workspace exceeds the session storage budget")
+                if self._key_policy_refuses(rel):
+                    not_saved.append(rel)
+                    continue
                 entry = manifest.get(rel)
                 if entry and entry["size"] == stat.st_size and entry["mtime_ns"] == stat.st_mtime_ns:
                     continue
@@ -137,4 +149,4 @@ class WorkspaceSync:
             del manifest[rel]
             deleted += 1
         self._save(manifest)
-        return {"uploaded": uploaded, "deleted": deleted}
+        return {"uploaded": uploaded, "deleted": deleted, **({"notSaved": sorted(not_saved)[:20]} if not_saved else {})}

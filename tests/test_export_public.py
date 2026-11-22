@@ -65,3 +65,64 @@ def test_export_is_one_clean_commit_and_refuses_internal_references(tmp_path):
     work_identity = _export(repo, tmp_path / "out-identity", GIT_AUTHOR_EMAIL=WORK_EMAIL)
     assert work_identity.returncode == 1 and f"commit-identity:1:{WORK_EMAIL}" in work_identity.stderr
     assert not (tmp_path / "out-identity").exists()
+
+
+def test_a_joined_account_id_is_caught_but_longer_digit_runs_are_not(tmp_path):
+    # An account ID glued to letters or underscores must be caught (grep -w would miss it), while a
+    # 13- or 16-digit run must not. Every digit value is built at runtime so no literal 12-digit ID
+    # sits in this file.
+    joined = f"acct_{ACCOUNT}_prod"
+    thirteen = ACCOUNT + "3"       # a 13-digit run
+    sixteen = ACCOUNT + "3456"     # a 16-digit run
+    repo = _repo(tmp_path / "ids", {"notes.md": f"{joined}\nthirteen {thirteen}\nsixteen {sixteen}\n"})
+    refused = _export(repo, tmp_path / "out-ids")
+    assert refused.returncode == 1 and not (tmp_path / "out-ids").exists()
+    assert f"./notes.md:1:{ACCOUNT}" in refused.stderr          # the joined ID, reported as 12 digits
+    assert thirteen not in refused.stderr and sixteen not in refused.stderr  # longer runs are not flagged
+
+
+def test_a_crlf_denylist_still_catches_a_planted_token(tmp_path):
+    # A denylist saved with CRLF endings used to leave a trailing \r on every pattern, so it matched
+    # nothing while the script still reported success. The pattern must now catch a planted token.
+    marker = "secret-internal-marker"
+    repo = _repo(tmp_path / "crlf", {"notes.md": f"see {marker} here\n"})
+    (repo / ".export-denylist").write_bytes(f"# private\r\n{marker}\r\n".encode())  # .gitignored, read fresh
+    refused = _export(repo, tmp_path / "out-crlf")
+    assert refused.returncode == 1 and not (tmp_path / "out-crlf").exists()
+    assert f"./notes.md:1:{marker}" in refused.stderr
+
+
+def test_a_denylist_with_no_usable_pattern_is_refused(tmp_path):
+    # Only comments, blanks and whitespace (CRLF included) yield no pattern: the script refuses
+    # rather than run a leak check that would match nothing and pass vacuously.
+    repo = _repo(tmp_path / "empty-deny", {"notes.md": "nothing to see\n"})
+    (repo / ".export-denylist").write_bytes(b"# only a comment\r\n\r\n   \r\n")
+    refused = _export(repo, tmp_path / "out-empty-deny")
+    assert refused.returncode == 1 and not (tmp_path / "out-empty-deny").exists()
+    assert "no usable patterns" in refused.stderr
+
+
+def test_a_non_utf8_denylist_is_refused(tmp_path):
+    # A Latin-1 / Windows-1252 byte (e.g. an accented name saved by legacy Windows) makes the
+    # denylist invalid UTF-8. It must be refused, not partly read: the byte tools would otherwise
+    # abort mid-stream and drop every later pattern while the leak check still passed.
+    repo = _repo(tmp_path / "latin1", {"notes.md": "nothing to see\n"})
+    (repo / ".export-denylist").write_bytes(b"caf\xe9-internal-host\n")  # 0xe9 is Latin-1 e-acute
+    refused = _export(repo, tmp_path / "out-latin1")
+    assert refused.returncode == 1 and not (tmp_path / "out-latin1").exists()
+    assert "not valid UTF-8" in refused.stderr
+
+
+def test_a_bom_denylist_catches_its_pattern_and_a_bom_comment_only_file_is_refused(tmp_path):
+    bom = b"\xef\xbb\xbf"
+    marker = "bom-internal-marker"
+    # A UTF-8 byte-order mark on line 1 must not hide the first pattern.
+    repo = _repo(tmp_path / "bom", {"notes.md": f"see {marker}\n"})
+    (repo / ".export-denylist").write_bytes(bom + f"{marker}\n".encode())
+    refused = _export(repo, tmp_path / "out-bom")
+    assert refused.returncode == 1 and f"./notes.md:1:{marker}" in refused.stderr
+    # A byte-order mark followed only by comments still yields no usable pattern.
+    repo2 = _repo(tmp_path / "bomc", {"notes.md": "clean\n"})
+    (repo2 / ".export-denylist").write_bytes(bom + b"# only a comment\n")
+    refused2 = _export(repo2, tmp_path / "out-bomc")
+    assert refused2.returncode == 1 and "no usable patterns" in refused2.stderr

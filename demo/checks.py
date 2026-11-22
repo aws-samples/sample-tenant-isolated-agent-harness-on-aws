@@ -229,7 +229,7 @@ def runtime_dns_blocked(demo: Demo) -> dict:
     if not gid:
         return _result("runtime-dns-blocked", "DNS Firewall blocks a non-allowlisted name for the runtime VPC",
                        "4 (DNS Firewall BLOCK)", "catch-all BLOCK, a narrow ALLOW list, bound to the VPC",
-                       "no DnsRuleGroupId output; deploy with -c demo=true", False)
+                       "no DnsRuleGroupId output; deploy with -c demo=true -c sandbox=true", False)
     rules = r53.list_firewall_rules(FirewallRuleGroupId=gid)["FirewallRules"]
     assoc = r53.list_firewall_rule_group_associations(FirewallRuleGroupId=gid)["FirewallRuleGroupAssociations"]
     catch_all = max(rules, key=lambda r: r["Priority"]) if rules else {}

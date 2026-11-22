@@ -37,8 +37,10 @@ def tenant_trust_conditions() -> dict:
 
 
 def _kms_via_s3(data_key_arn: str, region: str, object_arn_patterns: list[str], sid: str) -> dict:
-    # Bucket Keys are off, so S3 passes the object ARN as KMS encryption context. Even an S3
-    # policy mistake cannot decrypt another tenant's objects with this session.
+    # Bucket Keys are off, so S3 passes the object ARN as KMS encryption context. This IAM grant restricts
+    # nothing on its own, because the data key's policy grants the tenant roles directly; that key policy
+    # holds them to their tenant's prefixes (s3_object_context), so even an S3 policy mistake cannot
+    # decrypt another tenant's objects with this session.
     return {
         "Sid": sid, "Effect": "Allow",
         "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
@@ -48,6 +50,39 @@ def _kms_via_s3(data_key_arn: str, region: str, object_arn_patterns: list[str], 
             "StringLike": {"kms:EncryptionContext:aws:s3:arn": object_arn_patterns},
         },
     }
+
+
+S3_ARN_CONTEXT = "kms:EncryptionContext:aws:s3:arn"
+# The bucket's two top-level areas. Every object the data key encrypts sits under one of them.
+TOP_LEVEL_PREFIXES = ("tenants/", "transfer/")
+
+
+def s3_object_context(*, region: str, key_prefixes: list[str]) -> dict:
+    """Key-policy condition: the key is used only through S3, for objects under ``key_prefixes``.
+
+    S3 sends the object ARN as the encryption context because S3 Bucket Keys are off (with them on,
+    it sends the bucket ARN and this condition refuses every request). The bucket part is a
+    wildcard: the key policy cannot name the bucket, whose encryption names the key. In StringLike
+    '*' also matches '/', so 'arn:aws:s3:::*/tenants/A/*' alone would also match
+    tenants/B/workspace/tenants/A/x; the StringNotLike guard refuses a prefix that sits below a
+    tenants/ or transfer/ path. The cost: an object whose key repeats its own tenant's prefix
+    further down (tenants/A/workspace/tenants/A/x) is refused as well.
+
+    IAM Access Analyzer reports a wildcard straight after ${aws:PrincipalTag/TenantId} as too
+    permissive. That value is the tenant's 32-character storage ID, so the pattern is the tenant's
+    own prefix; and a session without the tag matches nothing here, so it is refused.
+    """
+    if not key_prefixes or not all(p.endswith("/") for p in key_prefixes):
+        raise ValueError("key prefixes must be given, each ending in '/'")
+    return {
+        "StringEquals": {"kms:ViaService": f"s3.{region}.amazonaws.com"},
+        "StringLike": {S3_ARN_CONTEXT: [f"arn:aws:s3:::*/{p}*" for p in key_prefixes]},
+        "StringNotLike": {S3_ARN_CONTEXT: [f"arn:aws:s3:::*/{area}*/{p}*"
+                                           for area in TOP_LEVEL_PREFIXES for p in key_prefixes]},
+    }
+
+
+TENANT_KEY_PREFIXES = [f"tenants/{T}/", f"transfer/{T}/"]
 
 
 def tenant_harness_policy(*, bucket_arn: str, data_key_arn: str, gateway_arn: str, region: str) -> dict:
@@ -137,6 +172,8 @@ def runtime_execution_policy(*, account: str, region: str, code_object_arn: str,
 
 # Listing reveals tenant storage IDs and file names; every listing action is covered.
 BUCKET_LIST_ACTIONS = ["s3:ListBucket", "s3:ListBucketVersions", "s3:ListBucketMultipartUploads"]
+# The listings that take the s3:prefix condition key.
+PREFIX_LIST_ACTIONS = ["s3:ListBucket", "s3:ListBucketVersions"]
 # Bucket settings that could loosen the backstop or copy, expire, expose or unprotect tenant data.
 BUCKET_CONFIG_ACTIONS = [
     "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketVersioning", "s3:PutLifecycleConfiguration",
@@ -148,7 +185,8 @@ BUCKET_CONFIG_ACTIONS = [
 
 def bucket_guardrail_statements(*, bucket_arn: str, tenant_role_arns: list[str], deployer_role_arns: list[str],
                                 admin_role_arns: list[str] = (), cleanup_role_arns: list[str] = (),
-                                demo_operator_role_arns: list[str] = ()) -> list[dict]:
+                                demo_operator_role_arns: list[str] = (),
+                                demo_tenant_prefixes: list[str] = ()) -> list[dict]:
     """Resource-policy backstop on the tenant bucket, against a broad S3 grant added later to any
     other principal.
 
@@ -160,9 +198,10 @@ def bucket_guardrail_statements(*, bucket_arn: str, tenant_role_arns: list[str],
 
     Break-glass roles are exempt from all three. The cleanup role is the stack's auto-delete
     function (sandbox deployments): on stack deletion it locks the bucket policy, lists and deletes.
+    The demo operator (present only with -c demo=true) is exempt for ``demo_tenant_prefixes`` only:
+    it may touch the demo tenants' objects and listings, never another tenant's, the transfer area
+    or the bucket's own policy and settings.
     """
-    # The demo operator (present only with -c demo=true) seeds and inspects tenant objects for the
-    # demo; it may touch tenant data and listings but never the bucket's own policy or settings.
     readers = [*tenant_role_arns, *admin_role_arns, *cleanup_role_arns, *demo_operator_role_arns]
     configurers = [*deployer_role_arns, *admin_role_arns, *cleanup_role_arns]
 
@@ -175,6 +214,21 @@ def bucket_guardrail_statements(*, bucket_arn: str, tenant_role_arns: list[str],
              readers),
         deny("ListingOnlyThroughTenantRoles", BUCKET_LIST_ACTIONS, bucket_arn, readers),
     ]
+    if demo_operator_role_arns:
+        if not demo_tenant_prefixes or not all(p.endswith("/") for p in demo_tenant_prefixes):
+            raise ValueError("the demo operator needs the demo tenants' prefixes, each ending in '/'")
+        operator = {"ArnEquals": {"aws:PrincipalArn": list(demo_operator_role_arns)}}
+        statements += [
+            {"Sid": "DemoOperatorOnlyDemoTenantObjects", "Effect": "Deny", "Principal": {"AWS": "*"},
+             "Action": "s3:*", "NotResource": [bucket_arn, *[f"{bucket_arn}/{p}*" for p in demo_tenant_prefixes]],
+             "Condition": operator},
+            {"Sid": "DemoOperatorListsOnlyDemoTenants", "Effect": "Deny", "Principal": {"AWS": "*"},
+             "Action": PREFIX_LIST_ACTIONS, "Resource": bucket_arn,
+             "Condition": {**operator, "StringNotLike": {"s3:prefix": [f"{p}*" for p in demo_tenant_prefixes]}}},
+            # s3:prefix does not apply to this listing, so it is refused outright.
+            {"Sid": "DemoOperatorListsNoUploads", "Effect": "Deny", "Principal": {"AWS": "*"},
+             "Action": "s3:ListBucketMultipartUploads", "Resource": bucket_arn, "Condition": operator},
+        ]
     if deployer_role_arns:
         statements.append(deny("BucketConfigOnlyThroughDeployments", BUCKET_CONFIG_ACTIONS, bucket_arn, configurers))
     return statements
